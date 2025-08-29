@@ -7,7 +7,6 @@ DOMAIN = "zendure_ha"
 
 CONF_APPTOKEN = "token"
 CONF_P1METER = "p1meter"
-CONF_PRICE = "price"
 CONF_MQTTLOG = "mqttlog"
 CONF_MQTTLOCAL = "mqttlocal"
 CONF_MQTTSERVER = "mqttserver"
@@ -38,8 +37,8 @@ class SmartMode:
     MATCHING_DISCHARGE = 3
     MATCHING_CHARGE = 4
     FAST_UPDATE = 100
-    MIN_POWER = 50
-    START_POWER = 100
+    MIN_POWER = 15
+    START_POWER = 50
     TIMEFAST = 2
     TIMEZERO = 4
     TIMEIDLE = 10
@@ -49,3 +48,5 @@ class SmartMode:
     IGNORE_DELTA = 3
     ZENSDK = 2
     CONNECTED = 10
+    MIN_POWER_COMP = 3
+    SOC_WINDOW_COMP = 5

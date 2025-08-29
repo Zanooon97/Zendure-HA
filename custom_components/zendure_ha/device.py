@@ -430,20 +430,17 @@ class ZendureDevice(EntityDevice):
         soc = float(getattr(self.electricLevel, "asNumber", 0) or 0.0)
         min_soc = float(getattr(self.minSoc, "asNumber", 0) or 0.0)
         upper = min_soc + SmartMode.SOC_WINDOW_COMP
-
         # Übergang: hat minSoc erreicht → "bereit"
         if soc <= min_soc:
             self._soc_window_ready = True
-
         # Wenn schon bereit und innerhalb Fenster → True
         if self._soc_window_ready and soc <= upper:
             return True
-
         # Sobald wieder über upper → Reset
         if self._soc_window_ready and soc > upper:
             self._soc_window_ready = False
-
         return False
+        
     def power_set(self, _state: ManagerState, _power: int) -> int:
         """Set the power output/input."""
         return 0

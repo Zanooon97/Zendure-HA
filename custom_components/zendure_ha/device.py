@@ -97,13 +97,13 @@ class ZendureDevice(EntityDevice):
 
         self.limitOutput = ZendureNumber(self, "outputLimit", self.entityWrite, None, "W", "power", 800, 0, NumberMode.SLIDER)
         self.limitInput = ZendureNumber(self, "inputLimit", self.entityWrite, None, "W", "power", 1200, 0, NumberMode.SLIDER)
-        self.minSoc = ZendureNumber(self, "minSoc", self.entityWrite, None, "%", "soc", 100, 0, NumberMode.SLIDER, 10)
-        self.socSet = ZendureNumber(self, "socSet", self.entityWrite, None, "%", "soc", 100, 0, NumberMode.SLIDER, 10)
+        self.minSoc = ZendureNumber(self, "minSoc", self.entityWrite, None, "%", "soc", 30, 5, NumberMode.SLIDER, 10)
+        self.socSet = ZendureNumber(self, "socSet", self.entityWrite, None, "%", "soc", 100, 70, NumberMode.SLIDER, 10)
         self.socStatus = ZendureSensor(self, "socStatus", state=0)
         self.socLimit = ZendureSensor(self, "socLimit", state=0)
 
         self.fusegroup: FuseGroup | None = None
-        fuseGroups = {0: "unused", 1: "owncircuit", 2: "group800", 3: "group1200", 4: "group2000", 5: "group2400", 6: "group3600"}
+        fuseGroups = {0: "unused", 1: "owncircuit", 2: "group800", 3: "group1200", 4: "group2400", 5: "group3600"}
         self.fuseGroup = ZendureRestoreSelect(self, "fuseGroup", fuseGroups, None)
         self.acMode = ZendureSelect(self, "acMode", {1: "input", 2: "output"}, self.entityWrite, 1)
 
@@ -116,11 +116,16 @@ class ZendureDevice(EntityDevice):
         self.packInputPower = ZendureSensor(self, "packInputPower", None, "W", "power", "measurement")
         self.outputPackPower = ZendureSensor(self, "outputPackPower", None, "W", "power", "measurement")
         self.solarInputPower = ZendureSensor(self, "solarInputPower", None, "W", "power", "measurement")
+        self.outputHomePower = ZendureSensor(self, "outputHomePower", None, "W", "power", "measurement")
+        self.dcStatus = ZendureSensor(self, "dcStatus", None)
+        self.pvStatus = ZendureSensor(self, "pvStatus", None)
         self.hemsState = ZendureBinarySensor(self, "hemsState")
         self.availableKwh = ZendureSensor(self, "available_kwh", None, "kWh", "energy", None, 1)
         self.connectionStatus = ZendureSensor(self, "connectionStatus")
         self.connection: ZendureRestoreSelect
         self.remainingTime = ZendureSensor(self, "remainingTime", None, "h", "duration", "measurement")
+        self._last_pv_on: datetime | None = None
+        self._soc_window_ready = False  # Merker pro Gerät
 
     def setStatus(self) -> None:
         from .api import Api
@@ -151,6 +156,9 @@ class ZendureDevice(EntityDevice):
         try:
             if changed:
                 match key:
+                    case "pvStatus":
+                        if value == 1 and self.solarInputPower.asNumber > 10:
+                            self._last_pv_on = datetime.now()
                     case "outputPackPower":
                         if value == 0:
                             self.switchCount.update_value(1 + self.switchCount.asNumber)
@@ -188,10 +196,10 @@ class ZendureDevice(EntityDevice):
 
         if power < 0:
             soc = self.socSet.asNumber
-            return 0 if level >= soc else min(999, self.kWh * 10 / -power * (soc - level))
+            return 0 if level >= soc else self.kWh * 10 / power * (soc - level)
 
         soc = self.minSoc.asNumber
-        return 0 if level <= soc else min(999, self.kWh * 10 / power * (level - soc))
+        return 0 if level <= soc else self.kWh * 10 / power * (level - soc)
 
     async def entityWrite(self, entity: EntityZendure, value: Any) -> None:
         if entity.unique_id is None:
@@ -404,6 +412,38 @@ class ZendureDevice(EntityDevice):
                 return self.electricLevel.asNumber <= self.minSoc.asNumber or self.socLimit.asNumber == 2
         return False
 
+    def is_full(self) -> bool:
+        return self.electricLevel.asNumber >= self.socSet.asNumber or self.socLimit.asNumber == 1
+
+    def pv_on(self) -> bool:
+        """PV gilt als aktiv, wenn Status==1 oder in den letzten 60s ==1 war."""
+        now = datetime.now()
+        if self.pvStatus.asNumber == 1 and self.solarInputPower.asNumber > 10:
+            self._last_pv_on = now
+            return True
+        if self._last_pv_on and now - self._last_pv_on <= timedelta(seconds=120):
+            return True
+        return False
+    
+    def in_soc_window(self) -> bool:
+        """True, wenn das Gerät im SoC-Window ist (zwischen minSoc und minSoc+SOC_WINDOW)."""
+        soc = float(getattr(self.electricLevel, "asNumber", 0) or 0.0)
+        min_soc = float(getattr(self.minSoc, "asNumber", 0) or 0.0)
+        upper = min_soc + SmartMode.SOC_WINDOW_COMP
+
+        # Übergang: hat minSoc erreicht → "bereit"
+        if soc <= min_soc:
+            self._soc_window_ready = True
+
+        # Wenn schon bereit und innerhalb Fenster → True
+        if self._soc_window_ready and soc <= upper:
+            return True
+
+        # Sobald wieder über upper → Reset
+        if self._soc_window_ready and soc > upper:
+            self._soc_window_ready = False
+
+        return False
     def power_set(self, _state: ManagerState, _power: int) -> int:
         """Set the power output/input."""
         return 0
@@ -415,6 +455,8 @@ class ZendureDevice(EntityDevice):
         self.powerAct = self.packInputPower.asInt - self.outputPackPower.asInt
         if self.powerAct != 0:
             self.powerAct += self.solarInputPower.asInt
+        elif self.powerAct == 0 and self.outputHomePower.asInt is not None:
+            self.powerAct = self.outputHomePower.asInt
         return self.powerAct
 
     @property
@@ -515,6 +557,8 @@ class ZendureZenSdk(ZendureDevice):
         self.powerAct = self.packInputPower.asInt - self.outputPackPower.asInt
         if self.powerAct != 0:
             self.powerAct += self.solarInputPower.asInt
+        elif self.powerAct == 0 and self.outputHomePower.asInt is not None:
+            self.powerAct = self.outputHomePower.asInt
         return self.powerAct
 
     def power_set(self, state: ManagerState, power: int) -> int:

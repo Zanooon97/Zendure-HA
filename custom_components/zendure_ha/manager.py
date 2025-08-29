@@ -60,6 +60,8 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.p1meterEvent: Callable[[], None] | None = None
         self.api = Api()
         self.update_count = 0
+        self._comp: dict[str, int] = {}   # deviceId -> gemerkte Kompensation (W)
+        self._soc_window_ready: dict[str, bool] = {} # deviceId -> gemerkte Kompensation (True / False)
 
     async def loadDevices(self) -> None:
         if self.config_entry is None or (data := await Api.Connect(self.hass, dict(self.config_entry.data), True)) is None:
@@ -153,7 +155,6 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                         break
 
             _LOGGER.debug(f"Update device: {device.name} ({device.deviceId})")
-            device.setStatus()
             await device.dataRefresh(self.update_count)
         self.update_count += 1
 
@@ -252,6 +253,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         except Exception as err:
             _LOGGER.error(err)
             _LOGGER.error(traceback.format_exc())
+    
 
     def update_power(self, power: int, state: ManagerState) -> None:
         """Update the power for all devices."""
@@ -268,9 +270,67 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         maxPower = 0
         totalKwh = 0
         devs = list[ZendureDevice]()
-        for d in sorted(self.devices, key=lambda d: int(d.availableKwh.asNumber * 2), reverse=not isCharging):
-            if (g := d.fusegroup) is not None and d.online:
-                useDevice = abs(0.85 * maxPower) < abs(power) if d.powerAct == 0 else abs(0.80 * maxPower) < abs(power)
+
+        # Volle Geräte zuerst, dann nach Available kWh pro Grät
+        sorted_devices = sorted(
+            self.devices,
+            key=lambda d: (d.is_full(), int(d.availableKwh.asNumber * 2)),
+            reverse=not isCharging
+        )
+
+        # Debug-Ausgabe der Sortierung
+        for idx, d in enumerate(sorted_devices, start=1):
+            _LOGGER.debug(
+                "[SORT] #%s: %s (SoC=%s, Avail=%.2f kWh, acMode=%s, pvPower=%s, isMaxSoc=%s, isMinSoc=%s)",
+                idx,
+                d.name,
+                getattr(d.electricLevel, "asNumber", None),
+                getattr(d.availableKwh, "asNumber", 0),
+                getattr(d.acMode, "value", None),
+                getattr(d.solarInputPower, "asNumber", None),
+                getattr(d.electricLevel, "asNumber", 0) >= getattr(d.socSet, "asNumber", 0),
+                getattr(d.electricLevel, "asNumber", 0) <= getattr(d.minSoc, "asNumber", 0),
+            )
+
+        # Debug-Ausgabe der Power Weitergabe
+        for idx, d in enumerate(sorted_devices, start=1):
+            _LOGGER.debug(
+                "[Pass Power] #%s: %s (pvStatus=%s, dcStatus=%s, deviceId=%s, pv_ON=%s)",
+                idx,
+                d.name,
+                getattr(d.pvStatus, "asNumber", None),
+                getattr(d.dcStatus, "asNumber", None),
+                d.deviceId,
+                d.pv_on()
+            )
+
+        #Wie viele "voll + PV=1"?
+        menge_devices = sum(1 for d in sorted_devices if d.is_full() and d.pv_on())
+        _LOGGER.debug("[PVon/isFULL] Menge Geräte: %d", menge_devices)
+
+        for idx, d in enumerate(sorted_devices):
+            g = d.fusegroup
+            if g is not None and d.online:
+
+                # --- useDevice-Entscheidung ---
+                base_useDevice = (abs(0.85 * maxPower) < abs(power)) if d.powerAct == 0 else (abs(0.80 * maxPower) < abs(power))
+
+                # zusätzlich: wenn im SoC-Window UND PV an UND wir entladen (nicht laden)
+                soc_window_use = (d.in_soc_window() and d.pv_on() and not isCharging)
+
+                useDevice = (
+                    (menge_devices > 1 and d.is_full() and d.pv_on())  # PV-Aufteilung zwischen vollen Geräten
+                    or base_useDevice
+                    or soc_window_use
+                )
+
+                # force useDevice nur bestimmen, wenn mind. 2 "voll+PV" vorhanden
+                if (menge_devices > 1 and d.is_full() and d.pv_on()):
+                    _LOGGER.debug(
+                        "[PV-Aufteilung] %s kündigt MaxSoc an und Teilt mit nächsten vollen Gerät die Last",
+                        d.name
+                    )
+
                 totalKwh += d.availableKwh.asNumber
                 if g.powerAvail == g.powerUsed or not useDevice or d.power_limit(state):
                     d.power_set(state, 0)
@@ -290,16 +350,64 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 g = d.fusegroup
                 if g is None:
                     continue
-                pwr = power * d.powerAvail / (maxPower if maxPower != 0 else 1)
 
+                pwr = power * d.powerAvail / (maxPower if maxPower != 0 else 1)
                 # adjust the power for the fusegroup
                 pwr = int(max(g.powerAvail - g.powerUsed, pwr) if isCharging else min(g.powerAvail - g.powerUsed, pwr))
-
                 maxPower -= d.powerAvail
                 pwr = max(d.powerMin, pwr) if isCharging else min(d.powerMax, pwr)
-                pwr = d.power_set(state, pwr)
 
-                # update the totals
+                    # ===== Kompensations-Logik (nur in schmalem SoC-Fenster + PV aktiv) =====
+                comp_prev = int(self._comp.get(d.deviceId, 0))
+                comp = 0
+
+                _LOGGER.debug("[SOC] %s -> in_soc_window=%s, comp_prev=%s", d.name, d.in_soc_window(), comp_prev)
+
+                if d.in_soc_window() and d.pv_on() and not isCharging:
+                    # Pack-Entladung (= Ausgang Akku) und -Ladung (= Eingang Akku)
+                    pack_out = max(0, int(getattr(d.packInputPower,   "asNumber", 0)))  # W: Batterie → Gerät (Entladen)
+                    pack_in  = max(0, int(getattr(d.outputPackPower,  "asNumber", 0)))  # W: Gerät → Batterie (Laden)
+
+                    if comp_prev == 0:
+                        # frisch starten: nur kompensieren, wenn wirklich Entladung vorliegt
+                        comp = pack_out if pack_out > SmartMode.MIN_POWER_COMP else 0
+                    else:
+                        # bestehende Kompensation dynamisch nachführen
+                        comp = comp_prev
+                        if pack_out > SmartMode.MIN_POWER_COMP:
+                            comp += pack_out
+                        elif pack_in > SmartMode.MIN_POWER_COMP:
+                            comp -= pack_in
+                            comp = max(0, comp)
+
+                    # Kompensation nur sinnvoll, wenn wir tatsächlich AC-Output setzen (pwr > 0)
+                    if pwr > 0 and comp > 0:
+                        # nicht unter das Geräteminimum drücken
+                        headroom = max(0, pwr - d.powerMin)
+                        comp = min(comp, headroom)
+                    else:
+                        comp = 0
+                else:
+                    comp = 0
+
+                # Kompensation merken (oder löschen)
+                if comp > 0:
+                    self._comp[d.deviceId] = comp
+                    _LOGGER.debug("[COMP] %s: komp=%d W (prev=%d) pwr=%d", d.name, comp, comp_prev, pwr)
+                else:
+                    if comp_prev:
+                        _LOGGER.debug("[COMP] %s: komp -> 0 (prev=%d)", d.name, comp_prev)
+                    self._comp.pop(d.deviceId, None)
+
+                # Effektive Soll-Leistung nach Kompensation
+                pwr = pwr - comp
+                pwr = max(0, pwr)
+                # finale Klammer (Sicherheit)
+                pwr = max(d.powerMin, pwr) if isCharging else min(d.powerMax, pwr)
+                # senden
+                pwr = d.power_set(state, pwr)
+                #pwr = pwr + comp
+                # update totals mit der **tatsächlich** gesetzten Leistung
                 power -= pwr
                 g.powerUsed += pwr
 

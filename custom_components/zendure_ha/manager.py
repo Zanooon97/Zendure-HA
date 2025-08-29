@@ -155,6 +155,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                         break
 
             _LOGGER.debug(f"Update device: {device.name} ({device.deviceId})")
+            device.setStatus()
             await device.dataRefresh(self.update_count)
         self.update_count += 1
 

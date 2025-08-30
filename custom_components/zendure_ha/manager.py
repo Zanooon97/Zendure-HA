@@ -155,7 +155,6 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                         break
 
             _LOGGER.debug(f"Update device: {device.name} ({device.deviceId})")
-            device.setStatus()
             await device.dataRefresh(self.update_count)
         self.update_count += 1
 
@@ -269,13 +268,14 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             g.powerUsed = 0
 
         maxPower = 0
+        maxPower2 = 0
         totalKwh = 0
         devs = list[ZendureDevice]()
 
         # Volle Geräte zuerst, dann nach Available kWh pro Grät
         sorted_devices = sorted(
             self.devices,
-            key=lambda d: (d.is_full(), int(d.availableKwh.asNumber * 2)),
+            key=lambda d: ((d.in_soc_window() and d.pv_on() and not isCharging), d.is_full(), int(d.availableKwh.asNumber * 2)),
             reverse=not isCharging
         )
 
@@ -314,7 +314,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             if g is not None and d.online:
 
                 # --- useDevice-Entscheidung ---
-                base_useDevice = (abs(0.85 * maxPower) < abs(power)) if d.powerAct == 0 else (abs(0.80 * maxPower) < abs(power))
+                base_useDevice = (abs(0.85 * maxPower2) < abs(power)) if d.powerAct == 0 else (abs(0.80 * maxPower2) < abs(power))
 
                 # zusätzlich: wenn im SoC-Window UND PV an UND wir entladen (nicht laden)
                 soc_window_use = (d.in_soc_window() and d.pv_on() and not isCharging)
@@ -332,6 +332,13 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                         d.name
                     )
 
+                _LOGGER.debug(
+                    "[Debugg] Name:%s, GpowerAvail:%s, GpowerUsed:%s, useDevice:%s, base_useDevice:%s, power_limit:%s, maxPower:%s, power:%s, DpowerAvail:%s, powerAct:%s",
+                    d.name, g.powerAvail, g.powerUsed, useDevice, base_useDevice, d.power_limit(state), maxPower, power, d.powerAvail, d.powerAct
+                )
+                comp_prev = int(self._comp.get(d.deviceId, 0))
+                _LOGGER.debug("[SOC] %s -> in_soc_window=%s, comp_prev=%s", d.name, d.in_soc_window(), comp_prev)
+
                 totalKwh += d.availableKwh.asNumber
                 if g.powerAvail == g.powerUsed or not useDevice or d.power_limit(state):
                     d.power_set(state, 0)
@@ -340,6 +347,9 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                     g.powerUsed += d.powerAvail
                     maxPower += d.powerAvail
                     devs.append(d)
+                    if not soc_window_use and base_useDevice:
+                        maxPower2 += d.powerAvail
+
         self.availableKwh.update_value(totalKwh)
 
         if len(devs) > 0:
@@ -352,17 +362,26 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 if g is None:
                     continue
 
+                _LOGGER.debug(
+                    "[COMP-INfo] Name:%s, useDevice:%s, base_useDevice:%s, maxPower:%s, power:%s, DpowerAvail:%s, powerAct:%s, powerMin:%s, powerAvail:%s, powerUsed:%s",
+                    d.name, useDevice, base_useDevice, maxPower, power, d.powerAvail, d.powerAct, d.powerMin, g.powerAvail, g.powerUsed
+                )
+
                 pwr = power * d.powerAvail / (maxPower if maxPower != 0 else 1)
                 # adjust the power for the fusegroup
                 pwr = int(max(g.powerAvail - g.powerUsed, pwr) if isCharging else min(g.powerAvail - g.powerUsed, pwr))
+                soc_window_use = (d.in_soc_window() and d.pv_on() and not isCharging)
+                #if not soc_window_use:
                 maxPower -= d.powerAvail
                 pwr = max(d.powerMin, pwr) if isCharging else min(d.powerMax, pwr)
+
+                
 
                     # ===== Kompensations-Logik (nur in schmalem SoC-Fenster + PV aktiv) =====
                 comp_prev = int(self._comp.get(d.deviceId, 0))
                 comp = 0
 
-                _LOGGER.debug("[SOC] %s -> in_soc_window=%s, comp_prev=%s", d.name, d.in_soc_window(), comp_prev)
+                
 
                 if d.in_soc_window() and d.pv_on() and not isCharging:
                     # Pack-Entladung (= Ausgang Akku) und -Ladung (= Eingang Akku)
@@ -400,6 +419,8 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                         _LOGGER.debug("[COMP] %s: komp -> 0 (prev=%d)", d.name, comp_prev)
                     self._comp.pop(d.deviceId, None)
 
+                
+
                 # Effektive Soll-Leistung nach Kompensation
                 pwr = pwr - comp
                 pwr = max(0, pwr)
@@ -411,6 +432,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 # update totals mit der **tatsächlich** gesetzten Leistung
                 power -= pwr
                 g.powerUsed += pwr
+                _LOGGER.debug("[COMP-INfo 2] %s: komp=%d W (prev=%d) pwr=%d power=%d", d.name, comp, comp_prev, pwr, power)
 
     def update_fusegroups(self) -> None:
         _LOGGER.info("Update fusegroups")

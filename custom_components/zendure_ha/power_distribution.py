@@ -267,7 +267,7 @@ def update_extra_candidate(dev, on_threshold=50, off_threshold=30):
 _last_active_count = 0
 _last_order: List[Any] = []
 
-def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainState) -> Dict[Any, int]:
+def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainState, rotate_flag: bool = False) -> Dict[Any, int]:
 
     global _last_order, _last_active_count, _soc_protection_active
 
@@ -330,14 +330,6 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
 
     active_count = min(max(1, _last_active_count), len(candidates))
 
-    from . import manager
-    #Hand rotieren
-    if getattr(manager, "global_manager", None) and manager.global_manager._rotate_flag:
-            candidates.append(candidates.pop(0))  # einmal rotieren
-            manager.global_manager._rotate_flag = False
-            manager.global_manager.rotate_switch.update_value(0)  # Switch wieder auf OFF
-            _LOGGER.info("Manual rotation ausgeführt.")
-
 
     #Last % bestimmen
     active_devs = candidates[:active_count]
@@ -370,7 +362,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
     _last_active_count = active_count
 
     # prüfen und rotieren
-    ROTATION_THRESHOLD = 0.10  # 10 % Energie differenz dann rotieren
+    ROTATION_THRESHOLD = 0.01  # 1 % Energie differenz dann rotieren
     if candidates:
         first = candidates[0]
         should_rotate = any(
@@ -378,7 +370,9 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
             for d in candidates
         )
 
-    if should_rotate:
+    if should_rotate or rotate_flag:
+        if rotate_flag:
+            _LOGGER.info("Manual rotation ausgeführt.")
         for d in devices:
             d.energy_diff_kwh = 0
 

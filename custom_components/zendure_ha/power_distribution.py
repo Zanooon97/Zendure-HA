@@ -203,7 +203,7 @@ def handle_soc_protect(
     return protect_alloc
 
 
-def solar_helper(dev, solar_threshold_on=55, solar_threshold_off=35):
+def solar_helper(dev, solar_threshold_on=80, solar_threshold_off=30):
     """
     Prüft pro Gerät ob es trotz SOCEMPTY durch Solarleistung aktiviert werden darf.
     Nutzt eine Hysterese: ON > 55W, OFF < 35W.
@@ -234,7 +234,7 @@ def should_use_helpers(needed: int) -> bool:
     """
     global _helper_mode_active
 
-    if needed > 50 and not _helper_mode_active:
+    if needed > 80 and not _helper_mode_active:
         _helper_mode_active = True
         _LOGGER.debug(f"Helfer aktiviert: Restlast {needed}W > 100W")
     elif needed < 30 and _helper_mode_active:
@@ -244,7 +244,7 @@ def should_use_helpers(needed: int) -> bool:
     return _helper_mode_active
 
 
-def update_extra_candidate(dev, on_threshold=50, off_threshold=30):
+def update_extra_candidate(dev, on_threshold=80, off_threshold=30):
     """
     Aktiviert ein Gerät als extra_candidate nur, wenn genug PV-Leistung da ist.
     Nutzt Hysterese: ON > on_threshold, OFF < off_threshold.
@@ -362,7 +362,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
     _last_active_count = active_count
 
     # prüfen und rotieren
-    ROTATION_THRESHOLD = 0.01  # 1 % Energie differenz dann rotieren
+    ROTATION_THRESHOLD = 0.0001  # 1 % Energie differenz dann rotieren
     if candidates:
         first = candidates[0]
         should_rotate = any(

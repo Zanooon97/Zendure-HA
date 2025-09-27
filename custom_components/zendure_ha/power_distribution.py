@@ -330,6 +330,15 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
 
     active_count = min(max(1, _last_active_count), len(candidates))
 
+    from . import manager
+    #Hand rotieren
+    if getattr(manager, "global_manager", None) and manager.global_manager._rotate_flag:
+            candidates.append(candidates.pop(0))  # einmal rotieren
+            manager.global_manager._rotate_flag = False
+            manager.global_manager.rotate_switch.update_value(0)  # Switch wieder auf OFF
+            _LOGGER.info("Manual rotation ausgeführt.")
+
+
     #Last % bestimmen
     active_devs = candidates[:active_count]
     first = active_devs[0]

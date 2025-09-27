@@ -362,7 +362,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
     _last_active_count = active_count
 
     # prüfen und rotieren
-    ROTATION_THRESHOLD = 0.0001  # 1 % Energie differenz dann rotieren
+    ROTATION_THRESHOLD = 0.1  # 10 % Energie differenz dann rotieren
     if candidates:
         first = candidates[0]
         should_rotate = any(

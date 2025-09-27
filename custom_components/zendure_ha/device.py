@@ -443,7 +443,7 @@ class ZendureDevice(EntityDevice):
     def pv_on(self) -> bool:
         """PV gilt als aktiv, wenn Status==1 oder in den letzten 120s ==1 war."""
         now = datetime.now()
-        if self.pvStatus.asNumber == 1 and self.solarInputPower.asNumber > 50:
+        if self.pvStatus.asNumber == 1 and self.solarInput.asNumber > 50:
             self._last_pv_on = now
             return True
         if self._last_pv_on and now - self._last_pv_on <= timedelta(seconds=120):

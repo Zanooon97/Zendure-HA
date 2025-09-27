@@ -65,6 +65,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.update_count = 0
 
         self._last_allocation: dict[ZendureDevice, int] = {}
+        self._vorlast_allocation: dict[ZendureDevice, int] = {}
         self._starting_device: ZendureDevice | None = None
         self._stopping_device: ZendureDevice | None = None
         
@@ -319,6 +320,9 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 
         # Start-/Stop-Gerät-Erkennung
         if self._starting_device is None and not isFast:
+
+            self._vorlast_allocation = allocation.copy()
+
             for dev, new_power in allocation.items():
                 last_power = self._last_allocation.get(dev, None)
 
@@ -326,20 +330,12 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 if last_power is None and new_power > 0:
                     self._starting_device = dev
                     _LOGGER.info(f"Startendes Gerät erkannt: {dev.name} Ziel {new_power}W")
-                    
+                    break
 
                 # Fall 2: Gerät von 0 -> >0
                 elif last_power == 0 and new_power > 0:
                     self._starting_device = dev
                     _LOGGER.info(f"Startendes Gerät erkannt (von 0→>0): {dev.name} Ziel {new_power}W")
-                    
-
-            # Stop-Gerät merken (für nach Kickstart)
-            for dev, new_power in allocation.items():
-                last_power = self._last_allocation.get(dev, None)
-                if last_power and last_power > 0 and new_power == 0:
-                    self._stopping_device = dev
-                    _LOGGER.info(f"Stoppendes Gerät erkannt: {dev.name} (von {last_power}W → 0W)")
                     break   
 
         if self._starting_device and not isFast:
@@ -349,6 +345,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 # Kickstart fertig
                 _LOGGER.info(f"{dev.name} gestartet, Kickstart beendet.")
                 self._starting_device = None
+                allocation.update(self._vorlast_allocation)
             else:
                 # Kickstart läuft
                 if main_state == MainState.GRID_DISCHARGE:
@@ -359,14 +356,9 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 return  # alle anderen Geräte warten
         elif self._starting_device and isFast:
             self._starting_device = None
-            self._stopping_device = None
+            allocation.update(self._vorlast_allocation)
+            _LOGGER.warning(f"Kickstart abgebrochen durch isFast allocation gesendet:{allocation}")
 
-        # Falls ein Gerät gestoppt werden soll → jetzt auf 0 setzen
-        if self._stopping_device:
-            stopping_dev = self._stopping_device
-            allocation[stopping_dev] = 0
-            _LOGGER.info(f"{self._stopping_device.name} auf 0W gesetzt nach Startphase.")
-            self._stopping_device = None
 
         # Normale Allocation schicken
         for dev, power in allocation.items():

@@ -330,11 +330,11 @@
         }
       },
       "grid_reverse": {
-        "name": "Bypass-Modus",
+        "name": "Energie Export",
         "state": {
-          "auto": "Automatisch",
-          "off": "Immer aus",
-          "on": "Immer an"
+          "disabled": "Deaktiviert",
+          "allow": "Erlaubt",
+          "forbidden": "Verboten"
         }
       }
     },

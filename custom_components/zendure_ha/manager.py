@@ -30,6 +30,7 @@ from .fusegroup import FuseGroup
 from .number import ZendureRestoreNumber
 from .select import ZendureRestoreSelect, ZendureSelect
 from .sensor import ZendureSensor
+from .switch import ZendureSwitch
 from .binary_sensor import ZendureBinarySensor
 from .power_distribution import MainState, SubState, decide_substate, distribute_power
 
@@ -84,7 +85,12 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.manualpower = ZendureRestoreNumber(self, "manual_power", None, None, "W", "power", 10000, -10000, NumberMode.BOX, True)
         self.availableKwh = ZendureSensor(self, "available_kwh", None, "kWh", "energy", None, 1)
         self.power = ZendureSensor(self, "power", None, "W", "power", None, 0)
-
+        self.rotate_switch = ZendureSwitch(
+            self,
+            "manual_rotation_devices",
+            self.update_rotation,  # Callback bei Schaltvorgang
+            value=False
+        )
         # load devices
         for dev in data["deviceList"]:
             try:
@@ -432,3 +438,11 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                     if len(self.devices) > 0:
                         for d in self.devices:
                             await d.power_off()
+
+    async def update_rotation(self, _entity, value: int) -> None:
+        """Wird aufgerufen, wenn der Switch in HA betätigt wird."""
+        if value == 1:
+            self._rotate_flag = True
+            _LOGGER.info("Manual rotation switch turned ON → rotation scheduled.")
+        else:
+            self._rotate_flag = False

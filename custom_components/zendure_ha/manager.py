@@ -61,6 +61,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.pwr_load = 0
         self.pwr_max = 0
         self._rotate_flag = False
+        self._first_start = True
         self.p1meterEvent: Callable[[], None] | None = None
         self.update_count = 0
 
@@ -352,13 +353,18 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                     await dev.power_discharge(min(dev.limitDischarge, 40))
                 else:
                     await dev.power_charge(-40)
-                _LOGGER.info(f"Kickstart für {dev.name}: 50W")
+                _LOGGER.info(f"Kickstart für {dev.name}: 40W")
                 return  # alle anderen Geräte warten
         elif self._starting_device and isFast:
             self._starting_device = None
             allocation.update(self._vorlast_allocation)
-            _LOGGER.warning(f"Kickstart abgebrochen durch isFast allocation gesendet:{allocation}")
+            _LOGGER.warning(f"Kickstart abgebrochen durch isFast alte allocation gesendet:{allocation}")
 
+        #Bereinigen vor ersten start.
+        if self._first_start:
+            self._first_start = False
+            for d in devices:
+                allocation[d] = 0
 
         # Normale Allocation schicken
         for dev, power in allocation.items():

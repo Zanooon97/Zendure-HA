@@ -60,12 +60,14 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.p1_history: deque[int] = deque([25, -25], maxlen=8)
         self.pwr_load = 0
         self.pwr_max = 0
+        self._rotate_flag = False
         self.p1meterEvent: Callable[[], None] | None = None
         self.update_count = 0
 
         self._last_allocation: dict[ZendureDevice, int] = {}
         self._starting_device: ZendureDevice | None = None
-
+        self._stopping_device: ZendureDevice | None = None
+        
     async def loadDevices(self) -> None:
         if self.config_entry is None or (data := await Api.Connect(self.hass, dict(self.config_entry.data), True)) is None:
             return
@@ -287,8 +289,15 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             dev.state_machine.sub = sub
             active_devices.append(dev)
 
+        # Manager setzt Flag zurück nach Benutzung
+        rotate_flag = self._rotate_flag
+
         # Leistung verteilen
-        allocation = distribute_power(active_devices, power_to_devide, main_state)
+        allocation = distribute_power(active_devices, power_to_devide, main_state, rotate_flag)
+
+        if rotate_flag:
+            self._rotate_flag = False
+            self.rotate_switch.update_value(0)
 
         # FuseGroup-Schutz: Allocation nach Sicherungslimits anpassen
         for fg in self.fuseGroups:
@@ -308,37 +317,56 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                         allocation[d] = int(allocation[d] * factor)
                 _LOGGER.warning(f"FuseGroup {fg.name}: Begrenzung Charge {total_power}W -> {fg.minpower}W")
                 
-        # Startgerät-Erkennung
+        # Start-/Stop-Gerät-Erkennung
         if self._starting_device is None and not isFast:
             for dev, new_power in allocation.items():
                 last_power = self._last_allocation.get(dev, None)
+
                 # Fall 1: Gerät neu drin
                 if last_power is None and new_power > 0:
                     self._starting_device = dev
-                    break
-                # Fall 2: Gerät von 0 auf >0
+                    _LOGGER.info(f"Startendes Gerät erkannt: {dev.name} Ziel {new_power}W")
+                    
+
+                # Fall 2: Gerät von 0 -> >0
                 elif last_power == 0 and new_power > 0:
                     self._starting_device = dev
-                    break
+                    _LOGGER.info(f"Startendes Gerät erkannt (von 0→>0): {dev.name} Ziel {new_power}W")
+                    
 
-        # Kickstart-Phase
+            # Stop-Gerät merken (für nach Kickstart)
+            for dev, new_power in allocation.items():
+                last_power = self._last_allocation.get(dev, None)
+                if last_power and last_power > 0 and new_power == 0:
+                    self._stopping_device = dev
+                    _LOGGER.info(f"Stoppendes Gerät erkannt: {dev.name} (von {last_power}W → 0W)")
+                    break   
+
         if self._starting_device and not isFast:
             dev = self._starting_device
             if (main_state == MainState.GRID_DISCHARGE and dev.pwr_home_out > 0) or \
             (main_state == MainState.GRID_CHARGE and dev.pwr_home_in > 0):
-                # Gerät hat bereits Output/Input Kickstart fertig
+                # Kickstart fertig
                 _LOGGER.info(f"{dev.name} gestartet, Kickstart beendet.")
                 self._starting_device = None
             else:
-                # Kickstart nur an das Startgerät
+                # Kickstart läuft
                 if main_state == MainState.GRID_DISCHARGE:
-                    await dev.power_discharge(min(dev.limitDischarge, 50))
+                    await dev.power_discharge(min(dev.limitDischarge, 40))
                 else:
-                    await dev.power_charge(-50)
+                    await dev.power_charge(-40)
                 _LOGGER.info(f"Kickstart für {dev.name}: 50W")
-                return  # WICHTIG: keine weiteren Geräte in dieser Runde ansteuern
+                return  # alle anderen Geräte warten
         elif self._starting_device and isFast:
             self._starting_device = None
+            self._stopping_device = None
+
+        # Falls ein Gerät gestoppt werden soll → jetzt auf 0 setzen
+        if self._stopping_device:
+            stopping_dev = self._stopping_device
+            allocation[stopping_dev] = 0
+            _LOGGER.info(f"{self._stopping_device.name} auf 0W gesetzt nach Startphase.")
+            self._stopping_device = None
 
         # Normale Allocation schicken
         for dev, power in allocation.items():

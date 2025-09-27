@@ -179,7 +179,7 @@ def handle_soc_protect(
             # Hysterese für minimale Entladeleistung
             if getattr(d, "is_soc_protect", False):
                 allowed = min(d.pwr_solar, d.limitDischarge, load)
-
+                load -= allowed
                 if not hasattr(d, "soc_helper_active"):
                     d.soc_helper_active = False
 

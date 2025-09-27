@@ -1,5 +1,5 @@
 {
-    "name": "Zendure Home Assistant Integration",
+    "name": "Forked Zendure Home Assistant Integration",
     "render_readme": true,
     "homeassistant": "2025.4.0",
     "zip_release": true,

@@ -133,9 +133,6 @@ def handle_bypass(devices: List[Any], soc_release: int = 90) -> Dict[Any, int]:
         else:
             d.is_bypass = False
 
-    if not bypass_alloc:
-        _LOGGER.debug("Kein Gerät für Bypass gefunden.")
-
     return bypass_alloc
 
 
@@ -203,10 +200,10 @@ def handle_soc_protect(
     return protect_alloc
 
 
-def solar_helper(dev, solar_threshold_on=80, solar_threshold_off=30):
+def solar_helper(dev, solar_threshold_on=50, solar_threshold_off=30):
     """
     Prüft pro Gerät ob es trotz SOCEMPTY durch Solarleistung aktiviert werden darf.
-    Nutzt eine Hysterese: ON > 55W, OFF < 35W.
+    Nutzt eine Hysterese: ON > 50W, OFF < 30W.
     """
     # initialisiere, falls das Attribut fehlt
     if not hasattr(dev, "helper_active"):
@@ -234,17 +231,17 @@ def should_use_helpers(needed: int) -> bool:
     """
     global _helper_mode_active
 
-    if needed > 80 and not _helper_mode_active:
+    if needed > 50 and not _helper_mode_active:
         _helper_mode_active = True
-        _LOGGER.debug(f"Helfer aktiviert: Restlast {needed}W > 100W")
-    elif needed < 30 and _helper_mode_active:
+        _LOGGER.debug(f"Helfer aktiviert: Restlast {needed}W > 50W")
+    elif needed < 10 and _helper_mode_active:
         _helper_mode_active = False
         _LOGGER.debug(f"Helfer deaktiviert: Restlast {needed}W < 30W")
 
     return _helper_mode_active
 
 
-def update_extra_candidate(dev, on_threshold=80, off_threshold=30):
+def update_extra_candidate(dev, on_threshold=50, off_threshold=30):
     """
     Aktiviert ein Gerät als extra_candidate nur, wenn genug PV-Leistung da ist.
     Nutzt Hysterese: ON > on_threshold, OFF < off_threshold.
@@ -303,12 +300,12 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
 
     else:  # DISCHARGE
         candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass and not d.is_hand_bypass]
-        #candidates_empty = [d for d in devices if d.state == DeviceState.SOCEMPTY and not solar_helper(d)]
-        #for d in candidates_empty:
-        #    allocation[d] = 0
+        candidates_empty = [d for d in devices if d.state == DeviceState.SOCEMPTY and not solar_helper(d)]
+        for d in candidates_empty:
+            allocation[d] = 0
 
         #soc protection at the morning an Hous priority
-        soc_alloc = handle_soc_protect(devices, power_to_devide)
+        soc_alloc = handle_soc_protect(candidates, power_to_devide)
         if _soc_protection_active:
             allocation.update(soc_alloc)
             candidates = [d for d in candidates if not getattr(d, "is_soc_protect", False)]
@@ -446,7 +443,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
                     continue
                 if not should_use_helpers(needed):  # Abbruch, wenn fast gedeckt
                     break
-                take = min(snap["pwr_solar"], needed, dev.limitDischarge)
+                take = min(snap["pwr_solar"], needed + 0, dev.limitDischarge)
                 allocation[dev] = take
                 helper_pwr += take
                 needed -= take

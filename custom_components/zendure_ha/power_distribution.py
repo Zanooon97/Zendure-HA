@@ -300,7 +300,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         #    allocation[d] = 100
 
     else:  # DISCHARGE
-        candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass]
+        candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass and not d.is_hand_bypass]
         candidates_empty = [d for d in devices if d.state == DeviceState.SOCEMPTY and not solar_helper(d)]
         for d in candidates_empty:
             allocation[d] = 0
@@ -406,6 +406,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
     if main_state == MainState.GRID_DISCHARGE:
 
         needed = 0
+        self_power_consumption = 0
         helper_pwr = 0
         pv_sum_active = sum(d.pwr_solar for d in active_devs)
         pv_sum_active_is_bypass = sum(d.pwr_solar for d in devices if d.is_bypass)
@@ -422,7 +423,22 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
             needed = abs(power_to_devide) - pv_sum_active - pv_sum_active_is_bypass
             _LOGGER.debug(f"PV reicht nicht ({pv_sum_active + pv_sum_active_is_bypass}W), es fehlen {needed}W → suche Extra-PV-Geräte")
 
-            # nur nicht aktive devices scannen + Hysterese berücksichtigen
+            # Eigenverbrauch von Bypass-Geräten berücksichtigen und zu needed addieren
+            self_power_consumption = sum(
+                max(0, d.pwr_solar - d.pwr_home_out)
+                for d in active_devs
+                if d.byPass.is_on and d.state != DeviceState.SOCFULL
+            )
+
+            if self_power_consumption > 0:
+                _LOGGER.debug(f"Eigenverbrauch durch Bypass-Geräte: {self_power_consumption}W")
+                needed += self_power_consumption
+                _LOGGER.debug(
+                    f"Eigenverbrauch durch Bypass-Geräte erkannt: {self_power_consumption}W "
+                    f"→ auf needed addiert (neuer needed={needed}W)"
+                )
+
+            # nur nicht-aktive devices scannen + Hysterese berücksichtigen
             extra_candidates = [
                 snap for snap in device_snapshots
                 if snap["name"] not in [d.name for d in active_devs]

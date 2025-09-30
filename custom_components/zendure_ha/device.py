@@ -446,7 +446,7 @@ class ZendureDevice(EntityDevice):
         if self.pvStatus.asNumber == 1 and self.solarInput.asNumber > 50:
             self._last_pv_on = now
             return True
-        if self._last_pv_on and now - self._last_pv_on <= timedelta(seconds=120):
+        if self._last_pv_on and now - self._last_pv_on <= timedelta(seconds=30000):
             return True
         return False
 

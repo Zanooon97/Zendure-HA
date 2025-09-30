@@ -11,6 +11,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from math import sqrt
 from typing import Any
+from statistics import median
 
 from homeassistant.auth.const import GROUP_ID_USER
 from homeassistant.auth.providers import homeassistant as auth_ha
@@ -56,20 +57,26 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.zero_next = datetime.min
         self.zero_fast = datetime.min
         self.check_reset = datetime.min
-        self.power_history: deque[int] = deque(maxlen=25)
+        self.power_history: deque[int] = deque(maxlen=40)
+        self.power_home_history: deque[int] = deque(maxlen=10)
         self.p1_history: deque[int] = deque([25, -25], maxlen=8)
         self.pwr_load = 0
         self.pwr_max = 0
         self._rotate_flag = False
+        self._detect_volatility = False
         self._first_start = True
         self.p1meterEvent: Callable[[], None] | None = None
         self.update_count = 0
+        self._last_volatility = None
+        self._volatile_until = None
 
         self._last_allocation: dict[ZendureDevice, int] = {}
         self._vorlast_allocation: dict[ZendureDevice, int] = {}
         self._starting_device: ZendureDevice | None = None
         self._stopping_device: ZendureDevice | None = None
-        
+
+        self.p1_history_time: deque[tuple[datetime, int]] = deque(maxlen=200)  # Zeitstempel + Wert
+
     async def loadDevices(self) -> None:
         if self.config_entry is None or (data := await Api.Connect(self.hass, dict(self.config_entry.data), True)) is None:
             return
@@ -89,10 +96,24 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.manualpower = ZendureRestoreNumber(self, "manual_power", None, None, "W", "power", 10000, -10000, NumberMode.BOX, True)
         self.availableKwh = ZendureSensor(self, "available_kwh", None, "kWh", "energy", None, 1)
         self.power = ZendureSensor(self, "power", None, "W", "power", None, 0)
+        self.power_avg = ZendureSensor(self, "power_avg", None, "W", "power", None, 0)
+        self.p1 = ZendureSensor(self, "p1", None, "W", "power", None, 0)
+        self.p1_avg = ZendureSensor(self, "p1_avg", None, "W", "power", None, 0)
+        self.p1_stddev = ZendureSensor(self, "p1_stddev", None, "W", "power", None, 0)
+        self.power_stddev = ZendureSensor(self, "power_stddev", None, "W", "power", None, 0)
+        self.power_home_stddev = ZendureSensor(self, "power_home_stddev", None, "W", "power", None, 0)
+        self.power_home_average = ZendureSensor(self, "power_home_average", None, "W", "power", None, 0)
+        self.volatil = ZendureBinarySensor(self, "volatil")
         self.rotate_switch = ZendureSwitch(
             self,
             "manual_rotation_devices",
             self.update_rotation,  # Callback bei Schaltvorgang
+            value=False
+        )        
+        self.detect_volatility_switch = ZendureSwitch(
+            self,
+            "detect_volatility_switch",
+            self.update_volatility_switch,
             value=False
         )
         # load devices
@@ -210,6 +231,9 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         if len(self.p1_history) > 1:
             avg = int(sum(self.p1_history) / len(self.p1_history))
             stddev = min(50, sqrt(sum([pow(i - avg, 2) for i in self.p1_history]) / len(self.p1_history)))
+            p1_stddev = sqrt(sum([pow(i - avg, 2) for i in self.p1_history]) / len(self.p1_history))
+            self.p1_avg.update_value(avg)
+            self.p1_stddev.update_value(p1_stddev)
             if isFast := abs(p1 - avg) > SmartMode.Threshold * stddev:
                 self.p1_history.clear()
         else:
@@ -219,17 +243,110 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
         # check minimal time between updates
         if isFast or time > self.zero_next:
-            try:
-                self.zero_next = time + timedelta(seconds=SmartMode.TIMEZERO)
-                if isFast:
-                    self.zero_fast = self.zero_next
-                    await self.powerChanged(p1, True)
-                else:
-                    self.zero_fast = time + timedelta(seconds=SmartMode.TIMEFAST)
-                    await self.powerChanged(p1, False)
-            except Exception as err:
-                _LOGGER.error(err)
-                _LOGGER.error(traceback.format_exc())
+
+            self.zero_next = time + timedelta(seconds=SmartMode.TIMEZERO)
+            if isFast:
+                self.zero_fast = self.zero_next
+                await self.powerChanged(p1, True)
+            else:
+                self.zero_fast = time + timedelta(seconds=SmartMode.TIMEFAST)
+                await self.powerChanged(p1, False)
+
+    def count_large_swings(self, values: list[int], delta_threshold: int) -> list[int]:
+        """Finde große Schwankungen (Peak ↔ Tal) in einer Werteliste."""
+        if len(values) < 3:
+            _LOGGER.debug("Zu wenige Werte für Schwankungserkennung: %s", values)
+            return []
+
+        extrema = []
+        for i in range(1, len(values) - 1):
+            if values[i] > values[i-1] and values[i] > values[i+1]:
+                extrema.append(values[i])  # lokales Maximum
+            elif values[i] < values[i-1] and values[i] < values[i+1]:
+                extrema.append(values[i])  # lokales Minimum
+
+        if not extrema:
+            _LOGGER.debug("Keine Extrema gefunden in Werten: %s", values)
+            return []
+
+        swings = []
+        for i in range(1, len(extrema)):
+            amplitude = abs(extrema[i] - extrema[i-1])
+            swings.append(amplitude)
+            _LOGGER.debug(
+                "Richtungswechsel #%s: von %s -> %s, Amplitude=%s W",
+                i, extrema[i-1], extrema[i], amplitude
+            )
+
+        large_swings = [a for a in swings if a >= delta_threshold]
+
+        _LOGGER.info(
+            "Schwankungsanalyse: Extrema=%s, Schwankungen=%s, GroßeSchwankungen>=%s=%s",
+            extrema, swings, delta_threshold, large_swings
+        )
+
+        return large_swings
+
+    def detect_p1_volatility(
+        self,
+        p1: int,
+        power_average: int,
+        window_sec: int = 40,
+        change_threshold: int = 4,
+        delta_threshold: int = 40,
+        calm_time: int = 10
+    ) -> tuple[bool, int]:
+        now = datetime.now()
+        self.p1_history_time.append((now, p1))
+
+        # Letzte Werte im Zeitfenster
+        recent = [val for t, val in self.p1_history_time if (now - t).total_seconds() <= window_sec]
+        if len(recent) < 3:
+            _LOGGER.debug("Zu wenige Werte im Fenster (%s)", len(recent))
+            return False, p1
+
+        # Prüfe ob überhaupt Schwankung da ist
+        span = max(recent) - min(recent)
+        if span < delta_threshold:
+            _LOGGER.debug("Keine relevante Schwankung: max=%s, min=%s, span=%s (<%s)", max(recent), min(recent), span, delta_threshold)
+            return False, p1
+
+        # Schwankungen zählen
+        large_swings = self.count_large_swings(recent, delta_threshold)
+
+        if len(large_swings) >= change_threshold:
+            current_p1_avg = int(sum(recent) / len(recent))
+            if not hasattr(self, "_baseline_p1_avg") or self._baseline_p1_avg is None:
+                self._baseline_p1_avg = current_p1_avg
+
+            correction = current_p1_avg - self._baseline_p1_avg
+            setpoint = power_average + correction
+            self._volatile_until = now + timedelta(seconds=calm_time)
+
+            _LOGGER.warning(
+                "Gezappel erkannt: %s große Schwankungen (Werte=%s, Extrema-Delta=%s) "
+                "-> Setpoint=power_avg(%s)+Korrektur(%s)=%s",
+                len(large_swings), recent, large_swings,
+                power_average, correction, setpoint
+            )
+            return True, setpoint
+
+        # Ruhephase
+        if self._volatile_until and now < self._volatile_until:
+            current_p1_avg = int(sum(recent) / len(recent))
+            correction = current_p1_avg - getattr(self, "_baseline_p1_avg", current_p1_avg)
+            setpoint = power_average + correction
+            _LOGGER.debug(
+                "Calm-Zeit aktiv (%ss verbleibend) -> Setpoint=power_avg(%s)+Korrektur(%s)=%s",
+                int((self._volatile_until - now).total_seconds()),
+                power_average, correction, setpoint
+            )
+            return True, setpoint
+
+        # Reset wenn ruhig
+        self._baseline_p1_avg = None
+        _LOGGER.debug("Keine Volatilität, Rohwert durchgelassen: %s", p1)
+        return False, p1
 
 
     async def powerChanged(self, p1: int, isFast: bool) -> None:
@@ -249,33 +366,59 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 devices.append(d)
 
         # Update the power entities
+        pwr_setpoint = pwr_home + p1
         self.power.update_value(pwr_home)
         self.availableKwh.update_value(availEnergy)
-        pwr_setpoint = pwr_home + p1
+        self.p1.update_value(p1)
+
+        #power home stddev
+        self.power_home_history.append(pwr_home)
+        power_home_average = sum(self.power_home_history) / len(self.power_home_history)
+        self.power_home_average.update_value(power_home_average)
+        if len(self.power_home_history) > 1:
+            power_home_stddev = sqrt(sum([pow(i - power_home_average, 2) for i in self.power_home_history]) / len(self.power_home_history))
+            self.power_home_stddev.update_value(power_home_stddev)
+
+        #power stddev
         self.power_history.append(pwr_setpoint)
-        p1_average = sum(self.power_history) // len(self.power_history)
+        power_average = sum(self.power_history) / len(self.power_history)
+        self.power_avg.update_value(power_average)
+        if len(self.power_history) > 1:
+            power_stddev = sqrt(sum([pow(i - power_average, 2) for i in self.power_history]) / len(self.power_history))
+            self.power_stddev.update_value(power_stddev)
+
+        if self._detect_volatility:
+            self.volatil.update_value(False)
+            _LOGGER.info("Volatill")
+            is_volatile, new_setpoint = self.detect_p1_volatility(p1, power_average)
+            if is_volatile:
+                self.volatil.update_value(True)
+                _LOGGER.info("Volatilllll")
+                pwr_setpoint = new_setpoint
 
         # Update power distribution.
         match self.operation:
             case SmartMode.MATCHING:
-                if (p1_average > 0 and pwr_setpoint >= 0) or (p1_average < 0 and pwr_setpoint <= 0):
-                    await self.powerDistribution(devices, p1_average, pwr_setpoint, pwr_solar, isFast)
+                if (power_average > 0 and pwr_setpoint >= 0) or (power_average < 0 and pwr_setpoint <= 0):
+                    await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, isFast)
                 else:
-                    await self.powerDistribution(devices, p1_average, pwr_setpoint, pwr_solar, isFast)
+                    await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, isFast)
                     #for d in devices:
                     #    if not d.is_bypass:
                     #        pwr_setpoint -= await d.power_discharge(max(0, min(pwr_setpoint, d.limitDischarge), d.pwr_solar))
 
             case SmartMode.MATCHING_DISCHARGE:
-                await self.powerDistribution(devices, p1_average, max(0, pwr_setpoint), pwr_solar, isFast)
+                await self.powerDistribution(devices, power_average, max(0, pwr_setpoint), pwr_solar, isFast)
 
             case SmartMode.MATCHING_CHARGE:
-                await self.powerDistribution(devices, p1_average, min(0, pwr_setpoint), pwr_solar, isFast)
+                await self.powerDistribution(devices, power_average, min(0, pwr_setpoint), pwr_solar, isFast)
 
             case SmartMode.MANUAL:
                 await self.powerDistribution(devices, int(self.manualpower.asNumber), int(self.manualpower.asNumber), pwr_solar, isFast)
 
     async def powerDistribution(self, devices: list[ZendureDevice], power_to_devide_avg: int, power_to_devide: int, pwr_solar: int, isFast: bool) -> None:
+
+
 
         # Leistung bestimmen (Hauslast + Zählerstand)
         _LOGGER.info(f"PowerChanged: power_to_devide={power_to_devide}")
@@ -328,13 +471,13 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 last_power = self._last_allocation.get(dev, None)
 
                 # Fall 1: Gerät neu drin
-                if last_power is None and new_power > 0:
+                if last_power is None and new_power > 0 and not dev.is_bypass:
                     self._starting_device = dev
                     _LOGGER.info(f"Startendes Gerät erkannt: {dev.name} Ziel {new_power}W")
                     break
 
                 # Fall 2: Gerät von 0 -> >0
-                elif last_power == 0 and new_power > 0:
+                elif last_power == 0 and new_power > 0 and not dev.is_bypass:
                     self._starting_device = dev
                     _LOGGER.info(f"Startendes Gerät erkannt (von 0→>0): {dev.name} Ziel {new_power}W")
                     break   
@@ -364,7 +507,8 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         if self._first_start:
             self._first_start = False
             for d in devices:
-                allocation[d] = 0
+                if d not in allocation:   # nur Geräte die nicht in allocation stehen
+                    allocation[d] = 0
 
         # Normale Allocation schicken
         for dev, power in allocation.items():
@@ -372,8 +516,12 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 await dev.power_discharge(min(dev.limitDischarge, power))
                 _LOGGER.info(f"Discharge={dev.name} power: {power}")
             else:
-                await dev.power_charge(-power)
-                _LOGGER.info(f"Charge={dev.name} power: {-power}")
+                if not dev.is_bypass:
+                    await dev.power_charge(-power)
+                    _LOGGER.info(f"Charge={dev.name} power: {-power}")
+                if dev.is_bypass:
+                    await dev.power_discharge(min(dev.limitDischarge, power))
+                    _LOGGER.info(f"Discharge={dev.name} power: {power}")
 
         # Allocation Speichern für nächste Runde
         self._last_allocation = allocation.copy()
@@ -472,3 +620,86 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             _LOGGER.info("Manual rotation switch turned ON → rotation scheduled.")
         else:
             self._rotate_flag = False
+
+    async def update_volatility_switch(self, _entity, value: int) -> None:
+        """Wird aufgerufen, wenn der Switch in HA betätigt wird."""
+        if value == 1:
+            self._detect_volatility = True
+            self.detect_volatility_switch.update_value(1)
+        else:
+            self._detect_volatility = False
+            self.detect_volatility_switch.update_value(0)
+
+    def detect_volatility_v3(
+        self,
+        pwr_setpoint: int,
+        power_history: deque[int],
+        sign_change_threshold: int = 4,
+        min_delta_abs: int = 100,
+        min_delta_rel: float = 0.05,
+        anti_wobble_time: int = 4,
+    ) -> int:
+        if len(power_history) < 5:
+            _LOGGER.debug("Zu wenige Werte für Volatilitätserkennung (<5) -> Rohwert %s", pwr_setpoint)
+            return pwr_setpoint
+
+        last_diff = abs(power_history[-1] - power_history[-2])
+        min_window = 10
+        max_window = 20
+        scale = min(1.0, last_diff / 600)
+        short_window_size = int(max_window - scale * (max_window - min_window))
+
+        short_window = list(power_history)[-short_window_size:]
+        avg_val = sum(short_window) / len(short_window)
+        stddev_val = sqrt(sum((i - avg_val) ** 2 for i in short_window) / len(short_window))
+
+        min_delta = max(min_delta_abs, int(min_delta_rel * abs(avg_val)))
+        diffs = [short_window[i] - short_window[i-1] for i in range(1, len(short_window))]
+        valid_diffs = [d for d in diffs if abs(d) >= min_delta]
+        sign_changes = sum(valid_diffs[k] * valid_diffs[k-1] < 0 for k in range(1, len(valid_diffs)))
+
+        # Debug-Ausgabe
+        _LOGGER.debug(
+            "VolatilityCheck: setpoint=%s, last_diff=%s, stddev=%.1f, window=%s, sign_changes=%s",
+            pwr_setpoint, last_diff, stddev_val, short_window_size, sign_changes
+        )
+
+        # 🔹 Gezappel-Erkennung
+        volatile = stddev_val > 150 or last_diff > 300 or sign_changes >= sign_change_threshold
+        if volatile:
+            _LOGGER.warning(
+                "Volatilität erkannt! stddev=%.1f, last_diff=%s, sign_changes=%s -> Glättung aktiv",
+                stddev_val, last_diff, sign_changes
+            )
+
+        # 🔹 Sofortiger Reset bei Ruhe
+        instant_diff = abs(power_history[-1] - power_history[-2])
+        if instant_diff < 50 and stddev_val < 100:
+            if volatile:
+                _LOGGER.info(
+                    "Gezappel beendet: instant_diff=%s, stddev=%.1f -> zurück zum Rohwert",
+                    instant_diff, stddev_val
+                )
+            volatile = False
+
+        # 🔹 Anti-Wobble
+        now = datetime.now()
+        if volatile:
+            self._last_volatility = now + timedelta(seconds=anti_wobble_time)
+            _LOGGER.debug("Anti-Wobble gesetzt bis %s", self._last_volatility)
+        elif self._last_volatility is not None and now < self._last_volatility:
+            if stddev_val > 100:
+                volatile = True
+                _LOGGER.debug("Anti-Wobble aktiv, stddev=%.1f -> Glättung verlängert", stddev_val)
+            else:
+                _LOGGER.debug("Anti-Wobble aktiv, aber stddev niedrig -> keine Glättung")
+                volatile = False
+
+        # 🔹 Ausgabe
+        if volatile:
+            smoothed = int(median(short_window))
+            _LOGGER.info("Glättung angewandt: Median(%s Werte) -> %s", short_window_size, smoothed)
+            return smoothed
+        else:
+            _LOGGER.debug("Keine Volatilität -> Rohwert %s", pwr_setpoint)
+            return pwr_setpoint

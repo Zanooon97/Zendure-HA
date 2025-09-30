@@ -69,7 +69,7 @@ def decide_substate(device, mainstate: MainState) -> SubState:
 
 _bypass_lock = False
 
-def handle_bypass(devices: List[Any], soc_release: int = 90) -> Dict[Any, int]:
+def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, soc_release: int = 90) -> Dict[Any, int]:
     """
     Prüft Geräte auf SOCFULL mit gridReverse.
     Gibt Allocation-Einträge zurück für Geräte, die in Bypass gehen.
@@ -97,7 +97,7 @@ def handle_bypass(devices: List[Any], soc_release: int = 90) -> Dict[Any, int]:
 
     # Wenn Lock aktiv ist, prüfen ob eines <90% gefallen ist
     if _bypass_lock:
-        if any(d.soc_lvl < soc_release for d in devices):
+        if any(d.soc_lvl < (d.max_soc - 10) for d in devices):
             _bypass_lock = False
             _LOGGER.info(f"Bypass-Lock aufgehoben (mind. ein Gerät < {soc_release}%).")
         else:
@@ -109,7 +109,7 @@ def handle_bypass(devices: List[Any], soc_release: int = 90) -> Dict[Any, int]:
 
     # Normaler Bypass-Check
     for d in devices:
-        if d.state == DeviceState.SOCFULL:
+        if d.state == DeviceState.SOCFULL and needed <= 0:
             if not d.pvaktiv:
                 d.is_bypass = False
                 _LOGGER.debug(f"{d.name} ist voll, aber pvaktiv=False → kein Bypass.")
@@ -124,6 +124,7 @@ def handle_bypass(devices: List[Any], soc_release: int = 90) -> Dict[Any, int]:
             if d.pwr_solar == 0:
                 kickstart = 50  # Kickstart
 
+            
             bypass_alloc[d] = d.pwr_solar + kickstart
             d.is_bypass = True
             _LOGGER.info(
@@ -293,13 +294,13 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
 
     # Charge
     if main_state == MainState.GRID_CHARGE:
-        candidates = [d for d in devices if d.state != DeviceState.SOCFULL and not d.is_bypass and not d.is_hand_bypass]
-        candidates_full = [d for d in devices if d.state == DeviceState.SOCFULL and not d.is_bypass and not d.is_hand_bypass]
-        for d in candidates_full:
-            allocation[d] = 0
+        candidates = [d for d in devices if d.state != DeviceState.SOCFULL]
+        #candidates_full = [d for d in devices if d.state == DeviceState.SOCFULL and not d.is_bypass and not d.is_hand_bypass]
+        #for d in candidates_full:
+        #    allocation[d] = 100
 
     else:  # DISCHARGE
-        candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass and not d.is_hand_bypass]
+        candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass]
         candidates_empty = [d for d in devices if d.state == DeviceState.SOCEMPTY and not solar_helper(d)]
         for d in candidates_empty:
             allocation[d] = 0
@@ -326,7 +327,6 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         candidates = ordered
 
     active_count = min(max(1, _last_active_count), len(candidates))
-
 
     #Last % bestimmen
     active_devs = candidates[:active_count]
@@ -408,6 +408,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         needed = 0
         helper_pwr = 0
         pv_sum_active = sum(d.pwr_solar for d in active_devs)
+        pv_sum_active_is_bypass = sum(d.pwr_solar for d in devices if d.is_bypass)
 
         if pv_sum_active >= abs(power_to_devide):
             # Aktive Geräte haben genug PV  proportional, begrenzt auf deren PV
@@ -418,8 +419,8 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
                 allocation[d] = int(abs(power_to_devide) * share)
         else:
             # Nicht genug PV, prüfen ob andere Geräte PV haben
-            needed = abs(power_to_devide) - pv_sum_active
-            _LOGGER.debug(f"PV reicht nicht ({pv_sum_active}W), es fehlen {needed}W → suche Extra-PV-Geräte")
+            needed = abs(power_to_devide) - pv_sum_active - pv_sum_active_is_bypass
+            _LOGGER.debug(f"PV reicht nicht ({pv_sum_active + pv_sum_active_is_bypass}W), es fehlen {needed}W → suche Extra-PV-Geräte")
 
             # nur nicht aktive devices scannen + Hysterese berücksichtigen
             extra_candidates = [
@@ -458,20 +459,30 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
             for d in active_devs:
                 allocation[d] = int(abs(power_to_devide) * abs(d.limitDischarge) / total_limit)
 
+        #deaktiviere nicht-gebrauchte devices die erster in solar helper waren
         for d in devices:
             if getattr(d, "is_solar_helper", False) and d not in allocation:
                 allocation[d] = 0
                 d.is_solar_helper = False
                 _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.")
 
+        #deaktiviere nicht-gebrauchte devices die erster in soc protect funktion waren
+        for d in devices:
+            if getattr(d, "is_soc_protect", False) and d not in allocation:
+                allocation[d] = 0
+                if d.soc_lvl > d.min_soc + 5:
+                    d.is_soc_protect = False
+                _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.2")
+
     else:  # GRID_CHARGE
+        needed = 0
         total_limit = sum(d.limitCharge for d in active_devs)
         for d in active_devs:
             allocation[d] = int(abs(power_to_devide) * abs(d.limitCharge) / abs(total_limit))
 
     _last_order = candidates.copy()
 
-    bypass_alloc = handle_bypass(devices)
+    bypass_alloc = handle_bypass(devices, needed, power_to_devide)
     allocation.update(bypass_alloc)
 
     _LOGGER.debug("Finale Allocation: " + str({d.name: p for d, p in allocation.items()}))

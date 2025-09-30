@@ -74,6 +74,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self._vorlast_allocation: dict[ZendureDevice, int] = {}
         self._starting_device: ZendureDevice | None = None
         self._stopping_device: ZendureDevice | None = None
+        self._stopping_devices: set[ZendureDevice] = set()
 
         self.p1_history_time: deque[tuple[datetime, int]] = deque(maxlen=200)  # Zeitstempel + Wert
 
@@ -290,7 +291,8 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
     def detect_p1_volatility(
         self,
         p1: int,
-        power_average: int,
+        power_history: deque[int],
+        avg_window_size: int = 5,      # NEU: Größe des Mittelwert-Fensters
         window_sec: int = 40,
         change_threshold: int = 4,
         delta_threshold: int = 40,
@@ -299,37 +301,63 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         now = datetime.now()
         self.p1_history_time.append((now, p1))
 
-        # Letzte Werte im Zeitfenster
+        # Letzte Werte im Zeitfenster (für P1-Analyse)
         recent = [val for t, val in self.p1_history_time if (now - t).total_seconds() <= window_sec]
-        if len(recent) < 3:
+        if len(recent) < 5:
             _LOGGER.debug("Zu wenige Werte im Fenster (%s)", len(recent))
             return False, p1
 
-        # Prüfe ob überhaupt Schwankung da ist
+        # 1) Prüfe ob überhaupt Schwankung da ist
         span = max(recent) - min(recent)
         if span < delta_threshold:
-            _LOGGER.debug("Keine relevante Schwankung: max=%s, min=%s, span=%s (<%s)", max(recent), min(recent), span, delta_threshold)
+            _LOGGER.debug("Keine relevante Schwankung: max=%s, min=%s, span=%s (<%s)",
+                        max(recent), min(recent), span, delta_threshold)
             return False, p1
 
-        # Schwankungen zählen
+        # 2) Schwankungen zählen
         large_swings = self.count_large_swings(recent, delta_threshold)
 
+        # 3) Power-Average aus den letzten N Werten der power_history
+        hist_values = list(power_history)[-avg_window_size:]
+        if hist_values:
+            power_avg_recent = int(sum(hist_values) / len(hist_values))
+        else:
+            power_avg_recent = p1  # fallback
+
+        # 4) Gezappel erkannt
         if len(large_swings) >= change_threshold:
             current_p1_avg = int(sum(recent) / len(recent))
             if not hasattr(self, "_baseline_p1_avg") or self._baseline_p1_avg is None:
                 self._baseline_p1_avg = current_p1_avg
 
             correction = current_p1_avg - self._baseline_p1_avg
-            setpoint = power_average + correction
+            setpoint = power_avg_recent + correction
             self._volatile_until = now + timedelta(seconds=calm_time)
 
             _LOGGER.warning(
-                "Gezappel erkannt: %s große Schwankungen (Werte=%s, Extrema-Delta=%s) "
-                "-> Setpoint=power_avg(%s)+Korrektur(%s)=%s",
-                len(large_swings), recent, large_swings,
-                power_average, correction, setpoint
+                "Gezappel erkannt: %s große Schwankungen -> "
+                "Setpoint=power_avg_recent(%s, letzte %s Werte)+Korrektur(%s)=%s",
+                len(large_swings), power_avg_recent, avg_window_size, correction, setpoint
             )
             return True, setpoint
+
+        # 5) Ruhephase
+        if self._volatile_until and now < self._volatile_until:
+            current_p1_avg = int(sum(recent) / len(recent))
+            correction = current_p1_avg - getattr(self, "_baseline_p1_avg", current_p1_avg)
+            setpoint = power_avg_recent + correction
+            _LOGGER.debug(
+                "Calm-Zeit aktiv (%ss verbleibend) -> "
+                "Setpoint=power_avg_recent(%s, letzte %s Werte)+Korrektur(%s)=%s",
+                int((self._volatile_until - now).total_seconds()),
+                power_avg_recent, avg_window_size, correction, setpoint
+            )
+            return True, setpoint
+
+        # Reset wenn ruhig
+        self._baseline_p1_avg = None
+        _LOGGER.debug("Keine Volatilität, Rohwert durchgelassen: %s", p1)
+        return False, p1
 
         # Ruhephase
         if self._volatile_until and now < self._volatile_until:
@@ -389,11 +417,9 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
         if self._detect_volatility:
             self.volatil.update_value(False)
-            _LOGGER.info("Volatill")
-            is_volatile, new_setpoint = self.detect_p1_volatility(p1, power_average)
+            is_volatile, new_setpoint = self.detect_p1_volatility(p1, self.power_history)
             if is_volatile:
                 self.volatil.update_value(True)
-                _LOGGER.info("Volatilllll")
                 pwr_setpoint = new_setpoint
 
         # Update power distribution.
@@ -509,6 +535,23 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             for d in devices:
                 if d not in allocation:   # nur Geräte die nicht in allocation stehen
                     allocation[d] = 0
+
+        # 1) Geräte merken, die jetzt auf 0 gesetzt wurden
+        for dev, power in allocation.items():
+            if power == 0 and not dev.is_bypass and not dev.is_hand_bypass:
+                self._stopping_devices.add(dev)
+                _LOGGER.info(f"{dev.name} → Stop-Vorgang erkannt")
+
+        # 2) Stop-Liste abarbeiten
+        for dev in list(self._stopping_devices):
+            # Prüfen ob Gerät wirklich bei 0 angekommen ist
+            if dev.pwr_home_out == 0 and dev.pwr_home_in == 0:
+                self._stopping_devices.remove(dev)
+                _LOGGER.info(f"{dev.name} hat 0 W erreicht → aus Stop-Liste entfernt")
+            else:
+                # Solange weiter 0 erzwingen
+                allocation[dev] = 0
+                _LOGGER.debug(f"{dev.name} wird weiterhin auf 0 gehalten (noch nicht bei 0 W)")
 
         # Normale Allocation schicken
         for dev, power in allocation.items():

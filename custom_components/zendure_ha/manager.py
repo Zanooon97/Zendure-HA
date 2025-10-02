@@ -58,6 +58,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.zero_fast = datetime.min
         self.check_reset = datetime.min
         self.power_history: deque[int] = deque(maxlen=40)
+        self.power_volatility_history: deque[int] = deque(maxlen=40)
         self.power_home_history: deque[int] = deque(maxlen=10)
         self.p1_history: deque[int] = deque([25, -25], maxlen=8)
         self.pwr_load = 0
@@ -104,6 +105,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.power_stddev = ZendureSensor(self, "power_stddev", None, "W", "power", None, 0)
         self.power_home_stddev = ZendureSensor(self, "power_home_stddev", None, "W", "power", None, 0)
         self.power_home_average = ZendureSensor(self, "power_home_average", None, "W", "power", None, 0)
+        self.isFast = ZendureBinarySensor(self, "isFast")
         self.volatil = ZendureBinarySensor(self, "volatil")
         self.rotate_switch = ZendureSwitch(
             self,
@@ -237,10 +239,12 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             self.p1_stddev.update_value(p1_stddev)
             if isFast := abs(p1 - avg) > SmartMode.Threshold * stddev:
                 self.p1_history.clear()
+                self.isFast.update_value(True)
         else:
             isFast = False
-        self.p1_history.append(p1)
+            self.isFast.update_value(False)
 
+        self.p1_history.append(p1)
 
         # check minimal time between updates
         if isFast or time > self.zero_next:
@@ -291,17 +295,25 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
     def detect_p1_volatility(
         self,
         p1: int,
-        power_history: deque[int],
-        avg_window_size: int = 5,      # NEU: Größe des Mittelwert-Fensters
-        window_sec: int = 40,
+        pwr_setpoint: int,
+        isFast: bool,
+        avg_window_size: int = 15,      # Größe des Mittelwert-Fensters für power_volatility_history
+        avg_recent_size: int = 7,      # 🚀 NEU: Größe des Fensters für current_p1_avg
+        window_sec: int = 60,
         change_threshold: int = 4,
-        delta_threshold: int = 40,
-        calm_time: int = 10
+        delta_threshold: int = 35,
+        calm_time: int = 30
     ) -> tuple[bool, int]:
         now = datetime.now()
         self.p1_history_time.append((now, p1))
+        self.power_volatility_history.append(pwr_setpoint)
+        power_volatility_history = self.power_volatility_history
+        if isFast:
+            self.p1_history_time.clear()
+            self.power_volatility_history.clear()
+            self._baseline_p1_avg = None
 
-        # Letzte Werte im Zeitfenster (für P1-Analyse)
+        # Letzte Werte im Zeitfenster
         recent = [val for t, val in self.p1_history_time if (now - t).total_seconds() <= window_sec]
         if len(recent) < 5:
             _LOGGER.debug("Zu wenige Werte im Fenster (%s)", len(recent))
@@ -317,8 +329,8 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         # 2) Schwankungen zählen
         large_swings = self.count_large_swings(recent, delta_threshold)
 
-        # 3) Power-Average aus den letzten N Werten der power_history
-        hist_values = list(power_history)[-avg_window_size:]
+        # 3) Power-Average aus den letzten N Werten
+        hist_values = list(power_volatility_history)[-avg_window_size:]
         if hist_values:
             power_avg_recent = int(sum(hist_values) / len(hist_values))
         else:
@@ -326,7 +338,10 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
         # 4) Gezappel erkannt
         if len(large_swings) >= change_threshold:
-            current_p1_avg = int(sum(recent) / len(recent))
+            #Nur die letzten avg_recent_size Werte verwenden
+            subset = recent[-avg_recent_size:] if len(recent) > avg_recent_size else recent
+            current_p1_avg = int(sum(subset) / len(subset))
+
             if not hasattr(self, "_baseline_p1_avg") or self._baseline_p1_avg is None:
                 self._baseline_p1_avg = current_p1_avg
 
@@ -341,9 +356,10 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             )
             return True, setpoint
 
-        # 5) Ruhephase
+        # 5) Calm-Zeit
         if self._volatile_until and now < self._volatile_until:
-            current_p1_avg = int(sum(recent) / len(recent))
+            subset = recent[-avg_recent_size:] if len(recent) > avg_recent_size else recent
+            current_p1_avg = int(sum(subset) / len(subset))
             correction = current_p1_avg - getattr(self, "_baseline_p1_avg", current_p1_avg)
             setpoint = power_avg_recent + correction
             _LOGGER.debug(
@@ -358,24 +374,6 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self._baseline_p1_avg = None
         _LOGGER.debug("Keine Volatilität, Rohwert durchgelassen: %s", p1)
         return False, p1
-
-        # Ruhephase
-        if self._volatile_until and now < self._volatile_until:
-            current_p1_avg = int(sum(recent) / len(recent))
-            correction = current_p1_avg - getattr(self, "_baseline_p1_avg", current_p1_avg)
-            setpoint = power_average + correction
-            _LOGGER.debug(
-                "Calm-Zeit aktiv (%ss verbleibend) -> Setpoint=power_avg(%s)+Korrektur(%s)=%s",
-                int((self._volatile_until - now).total_seconds()),
-                power_average, correction, setpoint
-            )
-            return True, setpoint
-
-        # Reset wenn ruhig
-        self._baseline_p1_avg = None
-        _LOGGER.debug("Keine Volatilität, Rohwert durchgelassen: %s", p1)
-        return False, p1
-
 
     async def powerChanged(self, p1: int, isFast: bool) -> None:
         """Entscheide MainState und verteile Leistung auf Devices."""
@@ -417,7 +415,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
         if self._detect_volatility:
             self.volatil.update_value(False)
-            is_volatile, new_setpoint = self.detect_p1_volatility(p1, self.power_history)
+            is_volatile, new_setpoint = self.detect_p1_volatility(p1, pwr_setpoint, isFast)
             if is_volatile:
                 self.volatil.update_value(True)
                 pwr_setpoint = new_setpoint
@@ -426,25 +424,23 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         match self.operation:
             case SmartMode.MATCHING:
                 if (power_average > 0 and pwr_setpoint >= 0) or (power_average < 0 and pwr_setpoint <= 0):
-                    await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, isFast)
+                    await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, p1, isFast)
                 else:
-                    await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, isFast)
+                    await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, p1, isFast)
                     #for d in devices:
                     #    if not d.is_bypass:
                     #        pwr_setpoint -= await d.power_discharge(max(0, min(pwr_setpoint, d.limitDischarge), d.pwr_solar))
 
             case SmartMode.MATCHING_DISCHARGE:
-                await self.powerDistribution(devices, power_average, max(0, pwr_setpoint), pwr_solar, isFast)
+                await self.powerDistribution(devices, power_average, max(0, pwr_setpoint), pwr_solar, p1, isFast)
 
             case SmartMode.MATCHING_CHARGE:
-                await self.powerDistribution(devices, power_average, min(0, pwr_setpoint), pwr_solar, isFast)
+                await self.powerDistribution(devices, power_average, min(0, pwr_setpoint), pwr_solar, p1, isFast)
 
             case SmartMode.MANUAL:
-                await self.powerDistribution(devices, int(self.manualpower.asNumber), int(self.manualpower.asNumber), pwr_solar, isFast)
+                await self.powerDistribution(devices, int(self.manualpower.asNumber), int(self.manualpower.asNumber), pwr_solar, p1, isFast)
 
-    async def powerDistribution(self, devices: list[ZendureDevice], power_to_devide_avg: int, power_to_devide: int, pwr_solar: int, isFast: bool) -> None:
-
-
+    async def powerDistribution(self, devices: list[ZendureDevice], power_to_devide_avg: int, power_to_devide: int, pwr_solar: int, p1: int, isFast: bool) -> None:
 
         # Leistung bestimmen (Hauslast + Zählerstand)
         _LOGGER.info(f"PowerChanged: power_to_devide={power_to_devide}")
@@ -464,7 +460,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         rotate_flag = self._rotate_flag
 
         # Leistung verteilen
-        allocation = distribute_power(active_devices, power_to_devide, main_state, rotate_flag)
+        allocation = distribute_power(active_devices, power_to_devide, main_state, p1, rotate_flag)
 
         if rotate_flag:
             self._rotate_flag = False
@@ -487,8 +483,25 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                     if d in allocation:
                         allocation[d] = int(allocation[d] * factor)
                 _LOGGER.warning(f"FuseGroup {fg.name}: Begrenzung Charge {total_power}W -> {fg.minpower}W")
-                
-        # Start-/Stop-Gerät-Erkennung
+
+        # 1) Geräte merken, die jetzt auf 0 gesetzt wurden
+        for dev, power in allocation.items():
+            if power == 0 and not dev.is_bypass and not dev.is_hand_bypass:
+                self._stopping_devices.add(dev)
+                _LOGGER.info(f"{dev.name} → Stop-Vorgang erkannt")
+
+        # 2) Stop-Liste abarbeiten
+        for dev in list(self._stopping_devices):
+            # Prüfen ob Gerät wirklich bei 0 angekommen ist
+            if dev.pwr_home_out == 0 and dev.pwr_home_in == 0:
+                self._stopping_devices.remove(dev)
+                _LOGGER.info(f"{dev.name} hat 0 W erreicht → aus Stop-Liste entfernt")
+            else:
+                # Solange weiter 0 erzwingen
+                allocation[dev] = 0
+                _LOGGER.debug(f"{dev.name} wird weiterhin auf 0 gehalten (noch nicht bei 0 W)")
+
+        # Start-Gerät-Erkennung
         if self._starting_device is None and not isFast:
 
             self._vorlast_allocation = allocation.copy()
@@ -535,23 +548,6 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             for d in devices:
                 if d not in allocation:   # nur Geräte die nicht in allocation stehen
                     allocation[d] = 0
-
-        # 1) Geräte merken, die jetzt auf 0 gesetzt wurden
-        for dev, power in allocation.items():
-            if power == 0 and not dev.is_bypass and not dev.is_hand_bypass:
-                self._stopping_devices.add(dev)
-                _LOGGER.info(f"{dev.name} → Stop-Vorgang erkannt")
-
-        # 2) Stop-Liste abarbeiten
-        for dev in list(self._stopping_devices):
-            # Prüfen ob Gerät wirklich bei 0 angekommen ist
-            if dev.pwr_home_out == 0 and dev.pwr_home_in == 0:
-                self._stopping_devices.remove(dev)
-                _LOGGER.info(f"{dev.name} hat 0 W erreicht → aus Stop-Liste entfernt")
-            else:
-                # Solange weiter 0 erzwingen
-                allocation[dev] = 0
-                _LOGGER.debug(f"{dev.name} wird weiterhin auf 0 gehalten (noch nicht bei 0 W)")
 
         # Normale Allocation schicken
         for dev, power in allocation.items():

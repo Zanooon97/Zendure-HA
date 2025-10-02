@@ -1,9 +1,12 @@
 import logging
 import math
+import time
 
 from typing import Dict, List, Any
 from enum import Enum, auto
 from .const import DeviceState, SmartMode
+
+from collections import deque
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -68,43 +71,47 @@ def decide_substate(device, mainstate: MainState) -> SubState:
 
 
 _bypass_lock = False
+_p1_history: deque[int] = deque(maxlen=20)   # globale P1-History
 
-def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, soc_release: int = 90) -> Dict[Any, int]:
+_slowdown_active = False
+_slowdown_since: float | None = None
+
+def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, p1: int = 0) -> Dict[Any, int]:
     """
     Prüft Geräte auf SOCFULL mit gridReverse.
     Gibt Allocation-Einträge zurück für Geräte, die in Bypass gehen.
-    Nutzt eine Hysterese:
+    Nutzt eine Hysterese + Slowdown mit Delay:
     - Bypass aktiv, wenn Geräte SOCFULL sind
-    - Rückkehr erst, wenn ein Gerät < soc_release % fällt (default: 90)
+    - Rückkehr erst, wenn ein Gerät < soc_release % fällt
+    - Slowdown greift erst nach 20s wenn irgendein Gerät pwr_home_in > 0 hat
     """
-    global _bypass_lock
+    global _bypass_lock, _p1_history, _slowdown_active, _slowdown_since
     bypass_alloc = {}
+
+    # P1-Verlauf mitteln
+    _p1_history.append(p1)
+    p1_average = sum(_p1_history) / len(_p1_history)
 
     # Check: Gibt es noch Geräte unterhalb SOCFULL?
     has_non_full = any(d.state != DeviceState.SOCFULL for d in devices)
 
     # Wenn alle voll → Lock setzen
     if not has_non_full and not _bypass_lock:
-        if not _bypass_lock:
-            _LOGGER.info("Alle Geräte voll → Bypass-Lock gesetzt.")
+        _LOGGER.info("Alle Geräte voll → Bypass-Lock gesetzt.")
         _bypass_lock = True
-
-        # alle Flags zurücksetzen
         for d in devices:
             d.is_bypass = False
-        _LOGGER.debug("Alle Geräte voll → alle d.is_bypass = False gesetzt.")
         return bypass_alloc  # kein Bypass aktiv solange Lock
 
     # Wenn Lock aktiv ist, prüfen ob eines <90% gefallen ist
     if _bypass_lock:
         if any(d.soc_lvl < (d.max_soc - 10) for d in devices):
             _bypass_lock = False
-            _LOGGER.info(f"Bypass-Lock aufgehoben (mind. ein Gerät < {soc_release}%).")
+            _LOGGER.info("Bypass-Lock aufgehoben (mind. ein Gerät < Release-Schwelle).")
         else:
-            _LOGGER.debug("Bypass-Lock aktiv → kein Bypass-Handling.")
-            # Flags sauberhalten
             for d in devices:
                 d.is_bypass = False
+            _LOGGER.debug("Bypass-Lock aktiv → kein Bypass-Handling.")
             return bypass_alloc
 
     # Normaler Bypass-Check
@@ -112,29 +119,31 @@ def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, soc_rel
         if d.state == DeviceState.SOCFULL and needed <= 0:
             if not d.pvaktiv:
                 d.is_bypass = False
-                _LOGGER.debug(f"{d.name} ist voll, aber pvaktiv=False → kein Bypass.")
                 continue
             if d.gridReverse is None:
                 d.is_bypass = False
-                _LOGGER.debug(f"{d.name} ist voll, aber gridReverse fehlt → kein Bypass.")
                 continue
 
-            # Gerät geht in Bypass
-            kickstart = 0
-            if d.pwr_solar == 0:
-                kickstart = 50  # Kickstart
+            kickstart = 50 if d.pwr_solar == 0 else 0
 
-            
-            bypass_alloc[d] = d.pwr_solar + kickstart
-            d.is_bypass = True
+            bypass_power = max(0, (d.pwr_home_out + p1 + 20 + kickstart))
+
             _LOGGER.info(
-                f"{d.name} ist voll → Bypass aktiv "
-                f"(PV={d.pwr_solar}W, Kick={kickstart}W, GridReverse={d.gridReverse})"
+                f"{d.name} → Bypass aktiv: "
+                f"pwr_home_out={d.pwr_home_out}W, "
+                f"p1={p1}W, "
+                f"Offset=20W, "
+                f"Kickstart={kickstart}W → "
+                f"BypassPower={bypass_power}W"
             )
+
+            bypass_alloc[d] = bypass_power
+            d.is_bypass = True
         else:
             d.is_bypass = False
 
     return bypass_alloc
+
 
 
 _soc_protection_active = False
@@ -176,7 +185,7 @@ def handle_soc_protect(
 
             # Hysterese für minimale Entladeleistung
             if getattr(d, "is_soc_protect", False):
-                allowed = min(d.pwr_solar, d.limitDischarge, load)
+                allowed = max(0, min(d.pwr_solar, d.limitDischarge, load))
                 load -= allowed
                 if not hasattr(d, "soc_helper_active"):
                     d.soc_helper_active = False
@@ -265,7 +274,7 @@ def update_extra_candidate(dev, on_threshold=50, off_threshold=30):
 _last_active_count = 0
 _last_order: List[Any] = []
 
-def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainState, rotate_flag: bool = False) -> Dict[Any, int]:
+def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainState, p1: int, rotate_flag: bool = False) -> Dict[Any, int]:
 
     global _last_order, _last_active_count, _soc_protection_active
 
@@ -359,7 +368,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
     _last_active_count = active_count
 
     # prüfen und rotieren
-    ROTATION_THRESHOLD = 0.1  # 10 % Energie differenz dann rotieren
+    ROTATION_THRESHOLD = 0.05  # 10 % Energie differenz dann rotieren
     if candidates:
         first = candidates[0]
         should_rotate = any(
@@ -384,7 +393,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         max_soc_lvl = max(soc_levels)
         min_soc_lvl = min(soc_levels)
 
-        if max_soc_lvl - min_soc_lvl > 20:
+        if max_soc_lvl - min_soc_lvl > 10:
             # es gibt ein Gerät mit deutlich höherem SOC
             fullest = max(candidates[1:], key=lambda d: d.soc_lvl, default=None)
             if fullest and fullest.soc_lvl >= min_soc_lvl + 20:
@@ -498,7 +507,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
 
     _last_order = candidates.copy()
 
-    bypass_alloc = handle_bypass(devices, needed, power_to_devide)
+    bypass_alloc = handle_bypass(devices, needed, power_to_devide, p1)
     allocation.update(bypass_alloc)
 
     _LOGGER.debug("Finale Allocation: " + str({d.name: p for d, p in allocation.items()}))

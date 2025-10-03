@@ -484,13 +484,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                         allocation[d] = int(allocation[d] * factor)
                 _LOGGER.warning(f"FuseGroup {fg.name}: Begrenzung Charge {total_power}W -> {fg.minpower}W")
 
-        # 1) Geräte merken, die jetzt auf 0 gesetzt wurden
-        for dev, power in allocation.items():
-            if power == 0 and not dev.is_bypass and not dev.is_hand_bypass:
-                self._stopping_devices.add(dev)
-                _LOGGER.info(f"{dev.name} → Stop-Vorgang erkannt")
-
-        # 2) Stop-Liste abarbeiten
+        # 1) Stop-Liste abarbeiten
         for dev in list(self._stopping_devices):
             # Prüfen ob Gerät wirklich bei 0 angekommen ist
             if dev.pwr_home_out == 0 and dev.pwr_home_in == 0:
@@ -500,6 +494,12 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 # Solange weiter 0 erzwingen
                 allocation[dev] = 0
                 _LOGGER.debug(f"{dev.name} wird weiterhin auf 0 gehalten (noch nicht bei 0 W)")
+
+        # 2) Geräte merken, die jetzt auf 0 gesetzt wurden
+        for dev, power in allocation.items():
+            if power == 0 and not dev.is_bypass and not dev.is_hand_bypass:
+                self._stopping_devices.add(dev)
+                _LOGGER.info(f"{dev.name} → Stop-Vorgang erkannt")
 
         # Start-Gerät-Erkennung
         if self._starting_device is None and not isFast:
@@ -539,8 +539,8 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 return  # alle anderen Geräte warten
         elif self._starting_device and isFast:
             self._starting_device = None
-            allocation.update(self._vorlast_allocation)
-            _LOGGER.warning(f"Kickstart abgebrochen durch isFast alte allocation gesendet:{allocation}")
+            #allocation.update(self._vorlast_allocation)
+            _LOGGER.warning(f"Kickstart abgebrochen durch isFast")
 
         #Bereinigen vor ersten start.
         if self._first_start:

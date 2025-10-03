@@ -126,7 +126,7 @@ def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, p1: int
 
             kickstart = 50 if d.pwr_solar == 0 else 0
 
-            bypass_power = max(0, (d.pwr_home_out + p1_average + 30 + kickstart))
+            bypass_power = min(d.pwr_solar, max(0, (d.pwr_home_out + p1_average + 30 + kickstart)))
 
             _LOGGER.info(
                 f"{d.name} → Bypass aktiv: "

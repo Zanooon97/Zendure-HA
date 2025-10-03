@@ -51,7 +51,7 @@ class SmartMode:
     MIN_POWER = 50
     START_POWER = 100
     TIMEFAST = 2.2
-    TIMEZERO = 4
+    TIMEZERO = 2.2
     TIMEIDLE = 10
     TIMERESET = 150
     Threshold = 6

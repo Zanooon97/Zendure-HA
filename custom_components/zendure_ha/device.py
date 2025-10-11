@@ -119,8 +119,17 @@ class ZendureDevice(EntityDevice):
         self.last_energy_kwh = 0.0
         self.energy_diff_kwh = 0.0
         self._last_pv_on: datetime | None = None
+        
         self.is_bypass: bool = False #'Bypass On Off'
+        self.is_throttled: bool = False 
         self.is_hand_bypass: bool = False #'Bypass On Off'
+
+        self.is_soc_protect: bool = False 
+        self.soc_helper_active: bool = False 
+        self.helper_active: bool = False 
+        self.extra_candidate_active: bool = False 
+        self.active: bool = True 
+        
 
         self.minCharge: int = 0
         self.minDischarge: int = 0
@@ -286,6 +295,7 @@ class ZendureDevice(EntityDevice):
     def mqttProperties(self, payload: Any) -> None:
         if self.lastseen == datetime.min:
             self.lastseen = datetime.now() + timedelta(minutes=5)
+            _LOGGER.debug(f"{self.name}: lastseen updated (MQTT) → {self.lastseen}")
             self.setStatus()
         else:
             self.lastseen = datetime.now() + timedelta(minutes=5)
@@ -452,6 +462,7 @@ class ZendureDevice(EntityDevice):
 
     async def power_get(self) -> bool:
         if self.lastseen < datetime.now():
+            _LOGGER.warning(f"{self.name}: lastseen expired ({self.lastseen}), marking offline")
             self.lastseen = datetime.min
             self.setStatus()
 
@@ -598,7 +609,7 @@ class ZendureZenSdk(ZendureDevice):
 
         _LOGGER.info(f"Power charge {self.name} => {power}")
         self.pwr_setpoint = power
-        await self.doCommand({"properties": {"smartMode": 0 if power == 0 else 1, "acMode": 1, "inputLimit": -power}})
+        await self.doCommand({"properties": {"smartMode": 0 if power == 0 else 0, "acMode": 1, "inputLimit": -power}})
         return power
 
     async def power_discharge(self, power: int) -> int:
@@ -609,7 +620,7 @@ class ZendureZenSdk(ZendureDevice):
 
         _LOGGER.info(f"Power discharge {self.name} => {power}")
         self.pwr_setpoint = power
-        await self.doCommand({"properties": {"smartMode": 0 if power == 0 else 1, "acMode": 2, "outputLimit": power}})
+        await self.doCommand({"properties": {"smartMode": 0 if power == 0 else 0, "acMode": 2, "outputLimit": power}})
         return power
 
     async def power_off(self) -> None:
@@ -620,15 +631,17 @@ class ZendureZenSdk(ZendureDevice):
     async def doCommand(self, command: Any) -> None:
         if self.connection.value != 0:
             await self.httpPost("properties/write", command)
+            _LOGGER.info(f"Power send over http to {self.name} => [command {command}]")
         else:
             self.mqttPublish(self.topic_write, command, self.mqtt)
+            _LOGGER.info(f"Power send over mqtt to {self.name} => [command {command}]")
 
     async def httpGet(self, url: str, key: str | None = None) -> dict[str, Any]:
         try:
             url = f"http://{self.ipAddress}/{url}"
             response = await self.session.get(url, headers=CONST_HEADER)
             payload = json.loads(await response.text())
-            self.lastseen = datetime.now()
+            self.lastseen = datetime.now() + timedelta(minutes=1)
             return payload if key is None else payload.get(key, {})
         except Exception as e:
             _LOGGER.error(f"HttpGet error {self.name} {e}!")
@@ -640,6 +653,8 @@ class ZendureZenSdk(ZendureDevice):
             command["id"] = self.httpid
             command["sn"] = self.snNumber
             url = f"http://{self.ipAddress}/{url}"
+
+            _LOGGER.debug(f"{self.name}: HTTP POST → {url} | payload={command}")
             await self.session.post(url, json=command, headers=CONST_HEADER)
         except Exception as e:
             _LOGGER.error(f"HttpPost error {self.name} {e}!")

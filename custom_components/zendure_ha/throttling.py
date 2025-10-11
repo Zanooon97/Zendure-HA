@@ -122,7 +122,7 @@ class PVRatioMatrix:
         )
         return avg_expected
         
-    def is_throttled(self, dev: Any, devices: List[Any], tolerance: float = 0.05, min_ref_solar: int = 10) -> bool:
+    def is_throttled(self, dev: Any, devices: List[Any], tolerance: float = 0.15, min_ref_solar: int = 10) -> bool:
         """Prüft, ob Gerät 'dev' gedrosselt ist (über alle gültigen Referenzen)."""
         refs = [
             r for r in devices

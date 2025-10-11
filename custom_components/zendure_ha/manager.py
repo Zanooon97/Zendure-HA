@@ -31,7 +31,7 @@ from .fusegroup import FuseGroup
 from .number import ZendureRestoreNumber
 from .select import ZendureRestoreSelect, ZendureSelect
 from .sensor import ZendureSensor
-from .switch import ZendureSwitch
+from .switch import ZendureRestoreSwitch, ZendureSwitch
 from .binary_sensor import ZendureBinarySensor
 from .power_distribution import MainState, SubState, decide_substate, distribute_power
 
@@ -57,7 +57,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.zero_next = datetime.min
         self.zero_fast = datetime.min
         self.check_reset = datetime.min
-        self.power_history: deque[int] = deque(maxlen=40)
+        self.power_history: deque[int] = deque(maxlen=5)
         self.power_volatility_history: deque[int] = deque(maxlen=40)
         self.power_home_history: deque[int] = deque(maxlen=10)
         self.p1_history: deque[int] = deque([25, -25], maxlen=8)
@@ -113,7 +113,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             self.update_rotation,  # Callback bei Schaltvorgang
             value=False
         )        
-        self.detect_volatility_switch = ZendureSwitch(
+        self.detect_volatility_switch = ZendureRestoreSwitch(
             self,
             "detect_volatility_switch",
             self.update_volatility_switch,
@@ -231,18 +231,19 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
             return
 
         # calculate the standard deviation
-        if len(self.p1_history) > 1:
+        isFast = True
+        if len(self.p1_history) > 2:
             avg = int(sum(self.p1_history) / len(self.p1_history))
-            stddev = min(50, sqrt(sum([pow(i - avg, 2) for i in self.p1_history]) / len(self.p1_history)))
+            stddev = max(10, min(50, sqrt(sum([pow(i - avg, 2) for i in self.p1_history]) / len(self.p1_history))))
             p1_stddev = sqrt(sum([pow(i - avg, 2) for i in self.p1_history]) / len(self.p1_history))
             self.p1_avg.update_value(avg)
-            self.p1_stddev.update_value(p1_stddev)
+            self.p1_stddev.update_value(stddev)
             if isFast := abs(p1 - avg) > SmartMode.Threshold * stddev:
                 self.p1_history.clear()
                 self.isFast.update_value(True)
-        else:
-            isFast = False
-            self.isFast.update_value(False)
+            else:
+                isFast = False
+                self.isFast.update_value(False)
 
         self.p1_history.append(p1)
 
@@ -385,8 +386,16 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         devices: list[ZendureDevice] = []
         for d in self.devices:
             if await d.power_get():
+
+                if d.is_bypass or d.is_hand_bypass or d.is_throttled:
+                    pwr_home_out = 0
+                elif d.is_soc_protect or d.soc_helper_active or d.helper_active or d.extra_candidate_active or d.active:
+                    pwr_home_out = d.pwr_home_out
+                else:
+                    pwr_home_out = 0
+
+                pwr_home += pwr_home_out - (d.pwr_home_in if d.active else 0)
                 availEnergy += d.availableKwh.asNumber
-                pwr_home += (d.pwr_home_out if not d.is_bypass and not d.is_hand_bypass else 0) - d.pwr_home_in
                 pwr_battery += d.pwr_battery_out - d.pwr_battery_in
                 pwr_solar += d.pwr_solar
                 devices.append(d)
@@ -426,10 +435,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 if (power_average > 0 and pwr_setpoint >= 0) or (power_average < 0 and pwr_setpoint <= 0):
                     await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, p1, isFast)
                 else:
-                    await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, p1, isFast)
-                    #for d in devices:
-                    #    if not d.is_bypass:
-                    #        pwr_setpoint -= await d.power_discharge(max(0, min(pwr_setpoint, d.limitDischarge), d.pwr_solar))
+                    await self.powerDistribution(devices, power_average, 0, pwr_solar, p1, isFast)
 
             case SmartMode.MATCHING_DISCHARGE:
                 await self.powerDistribution(devices, power_average, max(0, pwr_setpoint), pwr_solar, p1, isFast)
@@ -443,7 +449,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
     async def powerDistribution(self, devices: list[ZendureDevice], power_to_devide_avg: int, power_to_devide: int, pwr_solar: int, p1: int, isFast: bool) -> None:
 
         # Leistung bestimmen (Hauslast + Zählerstand)
-        _LOGGER.info(f"PowerChanged: power_to_devide={power_to_devide}")
+        _LOGGER.info(f"PowerChanged: power_to_devide={power_to_devide}, power_to_devide_avg:{power_to_devide_avg}")
 
         # MainState entscheiden
         main_state = MainState.GRID_CHARGE if power_to_devide < 0 else MainState.GRID_DISCHARGE
@@ -497,12 +503,12 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
         # 2) Geräte merken, die jetzt auf 0 gesetzt wurden
         for dev, power in allocation.items():
-            if power == 0 and not dev.is_bypass and not dev.is_hand_bypass:
+            if power == 0 and not dev.is_bypass and not dev.is_throttled and not dev.is_hand_bypass:
                 self._stopping_devices.add(dev)
                 _LOGGER.info(f"{dev.name} → Stop-Vorgang erkannt")
 
         # Start-Gerät-Erkennung
-        if self._starting_device is None and not isFast:
+        if len(allocation) > 1 and self._starting_device is None and not isFast:
 
             self._vorlast_allocation = allocation.copy()
 
@@ -510,13 +516,13 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 last_power = self._last_allocation.get(dev, None)
 
                 # Fall 1: Gerät neu drin
-                if last_power is None and new_power > 0 and not dev.is_bypass:
+                if last_power is None and new_power > 0 and not dev.is_bypass and not dev.is_throttled:
                     self._starting_device = dev
                     _LOGGER.info(f"Startendes Gerät erkannt: {dev.name} Ziel {new_power}W")
                     break
 
                 # Fall 2: Gerät von 0 -> >0
-                elif last_power == 0 and new_power > 0 and not dev.is_bypass:
+                elif last_power == 0 and new_power > 0 and not dev.is_bypass and not dev.is_throttled:
                     self._starting_device = dev
                     _LOGGER.info(f"Startendes Gerät erkannt (von 0→>0): {dev.name} Ziel {new_power}W")
                     break   
@@ -555,10 +561,10 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 await dev.power_discharge(min(dev.limitDischarge, power))
                 _LOGGER.info(f"Discharge={dev.name} power: {power}")
             else:
-                if not dev.is_bypass:
+                if not dev.is_bypass and not dev.is_throttled:
                     await dev.power_charge(-power)
                     _LOGGER.info(f"Charge={dev.name} power: {-power}")
-                if dev.is_bypass:
+                if dev.is_bypass or dev.is_throttled:
                     await dev.power_discharge(min(dev.limitDischarge, power))
                     _LOGGER.info(f"Discharge={dev.name} power: {power}")
 

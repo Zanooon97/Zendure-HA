@@ -1,10 +1,11 @@
 import logging
 import math
-import time
 
+from time import time
 from typing import Dict, List, Any
 from enum import Enum, auto
 from .const import DeviceState, SmartMode
+from .throttling import PVRatioMatrix
 
 from collections import deque
 
@@ -12,6 +13,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _last_active_count = 1  
 
+ratio_matrix = PVRatioMatrix("pv_ratios.db")
 
 class MainState(Enum):
     GRID_CHARGE = 5
@@ -71,10 +73,6 @@ def decide_substate(device, mainstate: MainState) -> SubState:
 
 
 _bypass_lock = False
-_p1_history: deque[int] = deque(maxlen=20)   # globale P1-History
-
-_slowdown_active = False
-_slowdown_since: float | None = None
 
 def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, p1: int = 0) -> Dict[Any, int]:
     """
@@ -85,12 +83,15 @@ def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, p1: int
     - Rückkehr erst, wenn ein Gerät < soc_release % fällt
     - Slowdown greift erst nach 20s wenn irgendein Gerät pwr_home_in > 0 hat
     """
-    global _bypass_lock, _p1_history, _slowdown_active, _slowdown_since
+    global _bypass_lock
     bypass_alloc = {}
 
-    # P1-Verlauf mitteln
-    _p1_history.append(p1)
-    p1_average = sum(_p1_history) / len(_p1_history)
+    ratio_matrix.calibrate(devices)
+
+    # Beispiel: Erwartete PV-Leistung berechnen
+    a = next(d for d in devices if d.name == "SolarFlow 800")
+    expected = ratio_matrix.expected_power(a, devices)
+    _LOGGER.info(f"Erwartete PV-Leistung für {a.name}: {expected} W")
 
     # Check: Gibt es noch Geräte unterhalb SOCFULL?
     has_non_full = any(d.state != DeviceState.SOCFULL for d in devices)
@@ -101,9 +102,10 @@ def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, p1: int
         _bypass_lock = True
         for d in devices:
             d.is_bypass = False
+            d.is_throttled = False
         return bypass_alloc  # kein Bypass aktiv solange Lock
 
-    # Wenn Lock aktiv ist, prüfen ob eines <90% gefallen ist
+    # Wenn Lock aktiv ist, prüfen ob eines 10% gefallen ist
     if _bypass_lock:
         if any(d.soc_lvl < (d.max_soc - 10) for d in devices):
             _bypass_lock = False
@@ -111,40 +113,56 @@ def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, p1: int
         else:
             for d in devices:
                 d.is_bypass = False
+                d.is_throttled = False
             _LOGGER.debug("Bypass-Lock aktiv → kein Bypass-Handling.")
             return bypass_alloc
 
     # Normaler Bypass-Check
     for d in devices:
         if d.state == DeviceState.SOCFULL and needed <= 0:
-            if not d.pvaktiv:
-                d.is_bypass = False
-                continue
-            if d.gridReverse is None:
+            if not d.pvaktiv or d.gridReverse is None:
                 d.is_bypass = False
                 continue
 
-            kickstart = 50 if d.pwr_solar == 0 else 0
-
-            bypass_power = min(d.pwr_solar, max(0, (d.pwr_home_out + p1_average + 30 + kickstart)))
+            bypass_power = min(d.pwr_solar if d.pwr_solar != 0 else 50, max(0, (d.pwr_home_out + p1 + 30)))
 
             _LOGGER.info(
                 f"{d.name} → Bypass aktiv: "
                 f"pwr_home_out={d.pwr_home_out}W, "
                 f"p1={p1}W, "
                 f"Offset=20W, "
-                f"Kickstart={kickstart}W → "
                 f"BypassPower={bypass_power}W"
             )
 
             bypass_alloc[d] = bypass_power
             d.is_bypass = True
+            d.is_throttled = False
+
+        elif (ratio_matrix.is_throttled(d, devices) or d.is_throttled) and needed <= 0 and d.soc_lvl > 89:
+            #hier das expected aber automatisch mit devices wie calc extra power
+
+            expected = ratio_matrix.expected_power(d, devices)
+            if expected is None:
+                continue  # keine Daten → überspringen
+                _LOGGER.info(
+                    f"{d.name} gedrosselt erkannt → übersprungern aber, "
+                )
+
+            bypass_power = max(0, expected - d.pwr_battery_in - d.pwr_battery_out - 30)
+
+            bypass_alloc[d] = bypass_power
+
+            _LOGGER.info(
+                f"{d.name} gedrosselt erkannt → erwartet {expected:.1f}W, "
+                f"tatsächlich {d.pwr_solar:.1f}W, Differenz {expected - d.pwr_solar:.1f}W"
+            )
+            d.is_bypass = False
+            d.is_throttled = True
         else:
             d.is_bypass = False
+            d.is_throttled = False
 
     return bypass_alloc
-
-
 
 _soc_protection_active = False
 
@@ -303,13 +321,9 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
 
     # Charge
     if main_state == MainState.GRID_CHARGE:
-        candidates = [d for d in devices if d.state != DeviceState.SOCFULL]
-        #candidates_full = [d for d in devices if d.state == DeviceState.SOCFULL and not d.is_bypass and not d.is_hand_bypass]
-        #for d in candidates_full:
-        #    allocation[d] = 100
-
+        candidates = [d for d in devices if d.state != DeviceState.SOCFULL and not d.is_throttled]
     else:  # DISCHARGE
-        candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass and not d.is_hand_bypass]
+        candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass and not d.is_throttled and not d.is_hand_bypass]
         candidates_empty = [d for d in devices if d.state == DeviceState.SOCEMPTY and not solar_helper(d)]
         for d in candidates_empty:
             allocation[d] = 0
@@ -354,10 +368,10 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
     )
 
     # 20/60-Regel
-    if load_pct > 60 and active_count < len(candidates):
+    if load_pct > 65 and active_count < len(candidates):
         active_count += 1
         _LOGGER.info("plus count")
-    elif load_pct < 20 and active_count > 1:
+    elif load_pct < 23.5 and active_count > 1:
         #hier das letzte gerät aus candidates[:active_count] auf 0 power setzten
         last_dev = candidates[active_count - 1]
         allocation[last_dev] = 0
@@ -368,7 +382,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
     _last_active_count = active_count
 
     # prüfen und rotieren
-    ROTATION_THRESHOLD = 0.05  # 10 % Energie differenz dann rotieren
+    ROTATION_THRESHOLD = 0.55  # 5 % Energie differenz dann rotieren
     if candidates:
         first = candidates[0]
         should_rotate = any(
@@ -393,20 +407,27 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         max_soc_lvl = max(soc_levels)
         min_soc_lvl = min(soc_levels)
 
-        if max_soc_lvl - min_soc_lvl > 10:
-            # es gibt ein Gerät mit deutlich höherem SOC
-            fullest = max(candidates[1:], key=lambda d: d.soc_lvl, default=None)
-            if fullest and fullest.soc_lvl >= min_soc_lvl + 20:
-                candidates.remove(fullest)
-                candidates.insert(0, fullest)
+        if max_soc_lvl - min_soc_lvl > 90:
+            if main_state == MainState.GRID_DISCHARGE:
+                # Discharge → das vollste Gerät zuerst nutzen
+                target = max(candidates[1:], key=lambda d: d.soc_lvl, default=None)
+                mode_text = "vollstes"
+            else:
+                # Charge → das leerste Gerät zuerst laden
+                target = min(candidates[1:], key=lambda d: d.soc_lvl, default=None)
+                mode_text = "leerstes"
+
+            if target:
+                candidates.remove(target)
+                candidates.insert(0, target)
                 _LOGGER.info(
-                    f"SOC-Trick: {fullest.name} (SOC={fullest.soc_lvl}%) "
-                    f"vor {first.name} (SOC={first.soc_lvl}%) gesetzt."
+                    f"SOC-Trick ({main_state}): {mode_text} Gerät {target.name} "
+                    f"(SOC={target.soc_lvl}%) wurde vor {first.name} (SOC={first.soc_lvl}%) gesetzt."
                 )
         else:
             # alle liegen nah beieinander
             candidates.append(candidates.pop(0))
-            _LOGGER.debug("Normale Rotation, da SOC-Differenz ≤ 20%")
+            _LOGGER.debug("Normale Rotation, da SOC-Differenz ≤ 5%")
 
     # Aktive Geräte festlegen
     active_devs = candidates[:active_count]
@@ -419,6 +440,40 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         helper_pwr = 0
         pv_sum_active = sum(d.pwr_solar for d in active_devs)
         pv_sum_active_is_bypass = sum(d.pwr_solar for d in devices if d.is_bypass)
+        pwr_sum_active_is_throttled = sum(d.pwr_home_out for d in devices if d.is_throttled)
+
+
+        # --- Theoretische PV-Summe aller aktiven Geräte ---
+        theoretic_pv_sum_active = 0
+        if pv_sum_active == 0:
+            for a in active_devs:
+                # passende Referenzen finden
+                refs = [
+                    r for r in devices
+                    if r.name != a.name
+                    and getattr(r, "pwr_solar", 0) > 10
+                ]
+
+                if not refs:
+                    _LOGGER.debug(f"[THEORETIC PV] Kein Referenzgerät für {a.name} gefunden.")
+                    continue
+
+                # Referenzgerät mit höchster PV-Leistung wählen
+                best_ref = max(refs, key=lambda r: r.pwr_solar)
+
+                expected = ratio_matrix.expected_power(a, best_ref)
+                if expected:
+                    theoretic_pv_sum_active += expected
+                    _LOGGER.debug(
+                        f"[THEORETIC PV] {a.name}: ref={best_ref.name}, "
+                        f"PV_ref={best_ref.pwr_solar:.1f}W, expected={expected:.1f}W"
+                    )
+                else:
+                    _LOGGER.debug(
+                        f"[THEORETIC PV] Keine Ratio-Daten für {a.name}/{best_ref.name} gefunden."
+                    )
+
+
 
         if pv_sum_active >= abs(power_to_devide):
             # Aktive Geräte haben genug PV  proportional, begrenzt auf deren PV
@@ -429,7 +484,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
                 allocation[d] = int(abs(power_to_devide) * share)
         else:
             # Nicht genug PV, prüfen ob andere Geräte PV haben
-            needed = abs(power_to_devide) - pv_sum_active - pv_sum_active_is_bypass
+            needed = abs(power_to_devide) - pv_sum_active - pv_sum_active_is_bypass - pwr_sum_active_is_throttled - theoretic_pv_sum_active
             _LOGGER.debug(f"PV reicht nicht ({pv_sum_active + pv_sum_active_is_bypass}W), es fehlen {needed}W → suche Extra-PV-Geräte")
 
             # Eigenverbrauch von Bypass-Geräten berücksichtigen und zu needed addieren
@@ -494,10 +549,12 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         #deaktiviere nicht-gebrauchte devices die erster in soc protect funktion waren
         for d in devices:
             if getattr(d, "is_soc_protect", False) and d not in allocation:
-                allocation[d] = 0
+                if d.pwr_home_out != 0 and d.pwr_home_in != 0:
+                    allocation[d] = 0
+                    _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig. protection: {d.is_soc_protect}")
                 if d.soc_lvl > d.min_soc + 5:
                     d.is_soc_protect = False
-                _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.2")
+                    _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig. protection: {d.is_soc_protect}")
 
     else:  # GRID_CHARGE
         needed = 0
@@ -506,6 +563,13 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
             allocation[d] = int(abs(power_to_devide) * abs(d.limitCharge) / abs(total_limit))
 
     _last_order = candidates.copy()
+
+    # --- Active-Flag setzen ---
+    for d in devices:
+        if d.active and d.pwr_home_out == 0 and d.pwr_home_in == 0:
+            d.active = False
+        if d in active_devs:
+            d.active = True
 
     bypass_alloc = handle_bypass(devices, needed, power_to_devide, p1)
     allocation.update(bypass_alloc)

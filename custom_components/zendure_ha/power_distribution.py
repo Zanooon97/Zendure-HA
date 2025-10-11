@@ -382,7 +382,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
     _last_active_count = active_count
 
     # prüfen und rotieren
-    ROTATION_THRESHOLD = 0.55  # 5 % Energie differenz dann rotieren
+    ROTATION_THRESHOLD = 0.05  # 5 % Energie differenz dann rotieren
     if candidates:
         first = candidates[0]
         should_rotate = any(
@@ -407,7 +407,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         max_soc_lvl = max(soc_levels)
         min_soc_lvl = min(soc_levels)
 
-        if max_soc_lvl - min_soc_lvl > 90:
+        if max_soc_lvl - min_soc_lvl > 5:
             if main_state == MainState.GRID_DISCHARGE:
                 # Discharge → das vollste Gerät zuerst nutzen
                 target = max(candidates[1:], key=lambda d: d.soc_lvl, default=None)

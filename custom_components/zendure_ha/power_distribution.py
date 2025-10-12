@@ -539,17 +539,16 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
             for d in active_devs:
                 allocation[d] = int(abs(power_to_devide) * abs(d.limitDischarge) / total_limit)
 
-        #deaktiviere nicht-gebrauchte devices die erster in solar helper waren
+        
         for d in devices:
+            #deaktiviere nicht-gebrauchte devices die erster in solar helper waren
             if getattr(d, "is_solar_helper", False) and d not in allocation:
                 allocation[d] = 0
                 d.is_solar_helper = False
                 _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.")
-
-        #deaktiviere nicht-gebrauchte devices die erster in soc protect funktion waren
-        for d in devices:
+            #deaktiviere nicht-gebrauchte devices die erster in soc protect funktion waren
             if getattr(d, "is_soc_protect", False) and d not in allocation:
-                if d.pwr_home_out != 0 and d.pwr_home_in != 0:
+                if d.pwr_home_out != 0 or d.pwr_home_in != 0:
                     allocation[d] = 0
                     _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig. protection: {d.is_soc_protect}")
                 if d.soc_lvl > d.min_soc + 5:

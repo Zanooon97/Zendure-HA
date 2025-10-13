@@ -298,8 +298,8 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         p1: int,
         pwr_setpoint: int,
         isFast: bool,
-        avg_window_size: int = 15,      # Größe des Mittelwert-Fensters für power_volatility_history
-        avg_recent_size: int = 7,      # 🚀 NEU: Größe des Fensters für current_p1_avg
+        avg_window_size: int = 20,      # Größe des Mittelwert-Fensters für power_volatility_history
+        avg_recent_size: int = 15,      # 🚀 NEU: Größe des Fensters für current_p1_avg
         window_sec: int = 60,
         change_threshold: int = 4,
         delta_threshold: int = 35,

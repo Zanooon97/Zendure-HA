@@ -1,583 +1,201 @@
 import logging
-import math
-
-from time import time
-from typing import Dict, List, Any
-from enum import Enum, auto
-from .const import DeviceState, SmartMode
-from .throttling import PVRatioMatrix
-
-from collections import deque
+import sqlite3
+import datetime
+from typing import List, Any
+from .const import DeviceState
 
 _LOGGER = logging.getLogger(__name__)
 
-_last_active_count = 1  
-
-ratio_matrix = PVRatioMatrix("pv_ratios.db")
-
-class MainState(Enum):
-    GRID_CHARGE = 5
-    GRID_DISCHARGE = 6
-
-
-class SubState(Enum):
-    IDLE = 1
-    CHARGE = 3
-    DISCHARGE = 4
-    BYPASS = 8
-    STARTING = 9
-
-
-class DeviceStateMachine:
-    def __init__(self):
-        self.main = MainState.GRID_CHARGE
-        self.sub = SubState.IDLE
-
-    def __repr__(self):
-        return f"<State main={self.main.name} sub={self.sub.name}>"
-
-
-def decide_substate(device, mainstate: MainState) -> SubState:
-    """Bestimme den SubState eines Geräts anhand der Sensordaten."""
-    if device.state == DeviceState.OFFLINE:
-        return SubState.IDLE
-
-    if device.byPass.is_on:
-        return SubState.BYPASS
-
-    # Netz laden
-    if mainstate == MainState.GRID_CHARGE:
-        if device.pwr_solar > 0 and device.pwr_home_out > 0:
-            return SubState.DISCHARGE
-        if device.pwr_battery_in > 0:
-            return SubState.CHARGE
-
-    # Netz entladen
-    if mainstate == MainState.GRID_DISCHARGE:
-        if device.pwr_home_out > 0 or device.pwr_battery_out > 0:
-            return SubState.DISCHARGE
-        if device.pwr_solar > 0 and device.pwr_home_out == 0:
-            return SubState.CHARGE
-
-    # IDLE wenn nichts passiert
-    if all(v == 0 for v in [
-        device.pwr_solar,
-        device.pwr_home_out,
-        device.pwr_home_in,
-        device.pwr_battery_in,
-        device.pwr_battery_out
-    ]):
-        return SubState.IDLE
-
-    return SubState.IDLE
-
-
-_bypass_lock = False
-
-def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, p1: int = 0) -> Dict[Any, int]:
-    """
-    Prüft Geräte auf SOCFULL mit gridReverse.
-    Gibt Allocation-Einträge zurück für Geräte, die in Bypass gehen.
-    Nutzt eine Hysterese + Slowdown mit Delay:
-    - Bypass aktiv, wenn Geräte SOCFULL sind
-    - Rückkehr erst, wenn ein Gerät < soc_release % fällt
-    - Slowdown greift erst nach 20s wenn irgendein Gerät pwr_home_in > 0 hat
-    """
-    global _bypass_lock
-    bypass_alloc = {}
-
-    ratio_matrix.calibrate(devices)
-
-    # Beispiel: Erwartete PV-Leistung berechnen
-    a = next(d for d in devices if d.name == "SolarFlow 800")
-    expected = ratio_matrix.expected_power(a, devices)
-    _LOGGER.info(f"Erwartete PV-Leistung für {a.name}: {expected} W")
-
-    # Check: Gibt es noch Geräte unterhalb SOCFULL?
-    has_non_full = any(d.state != DeviceState.SOCFULL for d in devices)
-
-    # Wenn alle voll → Lock setzen
-    if not has_non_full and not _bypass_lock:
-        _LOGGER.info("Alle Geräte voll → Bypass-Lock gesetzt.")
-        _bypass_lock = True
-        for d in devices:
-            d.is_bypass = False
-            d.is_throttled = False
-        return bypass_alloc  # kein Bypass aktiv solange Lock
-
-    # Wenn Lock aktiv ist, prüfen ob eines 10% gefallen ist
-    if _bypass_lock:
-        if any(d.soc_lvl < (d.max_soc - 10) for d in devices):
-            _bypass_lock = False
-            _LOGGER.info("Bypass-Lock aufgehoben (mind. ein Gerät < Release-Schwelle).")
-        else:
-            for d in devices:
-                d.is_bypass = False
-                d.is_throttled = False
-            _LOGGER.debug("Bypass-Lock aktiv → kein Bypass-Handling.")
-            return bypass_alloc
-
-    # Normaler Bypass-Check
-    for d in devices:
-        if d.state == DeviceState.SOCFULL and needed <= 0:
-            if not d.pvaktiv or d.gridReverse is None:
-                d.is_bypass = False
-                continue
-
-            bypass_power = min(d.pwr_solar if d.pwr_solar != 0 else 50, max(0, (d.pwr_home_out + p1 + 30)))
-
-            _LOGGER.info(
-                f"{d.name} → Bypass aktiv: "
-                f"pwr_home_out={d.pwr_home_out}W, "
-                f"p1={p1}W, "
-                f"Offset=20W, "
-                f"BypassPower={bypass_power}W"
+class PVRatioMatrix:
+    def __init__(self, db_path="pv_ratios.db"):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        cur = self.conn.cursor()
+        cur.execute("PRAGMA table_info(pv_ratios)")
+        cols = [row[1] for row in cur.fetchall()]
+        if "second" not in cols:
+            _LOGGER.warning("Alte pv_ratios-Tabelle ohne 'second' erkannt → wird neu erstellt!")
+            cur.execute("DROP TABLE IF EXISTS pv_ratios")
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS pv_ratios (
+                day TEXT,
+                hour INTEGER,
+                minute INTEGER,
+                second INTEGER,
+                device_a TEXT,
+                device_b TEXT,
+                ratio REAL,
+                PRIMARY KEY (day, hour, minute, second, device_a, device_b)
             )
+        """)
+        self.conn.commit()
 
-            bypass_alloc[d] = bypass_power
-            d.is_bypass = True
-            d.is_throttled = False
+    def calibrate(self, devices: list):
+        """Speichert alle Ratios zwischen allen Geräten pro Minute"""
+        now = datetime.datetime.now()
+        day = now.date().isoformat()
 
-        elif (ratio_matrix.is_throttled(d, devices) or d.is_throttled) and needed <= 0 and d.soc_lvl > 89:
-            #hier das expected aber automatisch mit devices wie calc extra power
-
-            expected = ratio_matrix.expected_power(d, devices)
-            if expected is None:
-                continue  # keine Daten → überspringen
-                _LOGGER.info(
-                    f"{d.name} gedrosselt erkannt → übersprungern aber, "
-                )
-
-            bypass_power = max(0, expected - d.pwr_battery_in - d.pwr_battery_out - 30)
-
-            bypass_alloc[d] = bypass_power
-
-            _LOGGER.info(
-                f"{d.name} gedrosselt erkannt → erwartet {expected:.1f}W, "
-                f"tatsächlich {d.pwr_solar:.1f}W, Differenz {expected - d.pwr_solar:.1f}W"
-            )
-            d.is_bypass = False
-            d.is_throttled = True
-        else:
-            d.is_bypass = False
-            d.is_throttled = False
-
-    return bypass_alloc
-
-_soc_protection_active = False
-
-def handle_soc_protect(
-    devices: List[Any],
-    power_to_devide: int,
-    discharge_on: int = 50,
-    discharge_off: int = 30,
-) -> Dict[Any, int]:
-    """
-    Aktiviert SOC-Schutz nur, wenn Solar deutlich kleiner als die Last ist.
-    - Schutz AUS, wenn total_pv > Last+60
-    - Schutz EIN, wenn total_pv <= Last+5
-    - Pro Gerät Hysterese für minimale Entladung (50W / 30W)
-    """
-    global _soc_protection_active
-    protect_alloc: Dict[Any, int] = {}
-
-    total_pv = sum(d.pwr_solar for d in devices if d.pwr_solar > 0)
-    load = abs(power_to_devide)
-
-    # Hysterese für Aktivierung/Deaktivierung
-    if total_pv > load + 60:
-        _soc_protection_active = False
-        _LOGGER.debug(f"SOC-Schutz AUS: Solar={total_pv}W > Last+60 ({load+60}W)")
-    elif total_pv <= load + 5:
-        _soc_protection_active = True
-        _LOGGER.debug(f"SOC-Schutz EIN: Solar={total_pv}W <= Last+5 ({load+5}W)")
-
-    soc_protect_devices = [dev for dev in devices if dev.is_soc_protect]
-    num_soc_protect = len(soc_protect_devices)
-
-    # Nur wenn Schutz aktiv ist, Geräte markieren
-    if _soc_protection_active:
-        for d in devices:
-            # globale SOC-Logik
-            if d.soc_lvl <= d.min_soc:
-                d.is_soc_protect = True
-            elif d.soc_lvl > d.min_soc + 5:
-                d.is_soc_protect = False
-
-            # Hysterese für minimale Entladeleistung
-            if d.is_soc_protect:
-
-                per_device_load = load / num_soc_protect if num_soc_protect > 0 else 0
-                allowed = max(0, min(d.pwr_solar if not d.byPass.is_on else d.limitDischarge, d.limitDischarge, per_device_load))
-
-                if not hasattr(d, "soc_helper_active"):
-                    d.soc_helper_active = False
-
-                if allowed > discharge_on:
-                    if not d.soc_helper_active:
-                        _LOGGER.info(f"SOC-Helfer AKTIV für {d.name}: {allowed}W > {discharge_on}W")
-                    d.soc_helper_active = True
-                elif allowed < discharge_off:
-                    if d.soc_helper_active:
-                        protect_alloc[d] = 0
-                        _LOGGER.info(f"SOC-Helfer AUS für {d.name}: {allowed}W < {discharge_off}W")
-                    d.soc_helper_active = False
-
-                if d.soc_helper_active:
-                    protect_alloc[d] = allowed
-                    _LOGGER.info(
-                        f"{d.name} SOC-Schutz aktiv: SOC={d.soc_lvl}%, "
-                        f"PV={d.pwr_solar}W, erlaubt={allowed}W"
+        for i, a in enumerate(devices):
+            for j, b in enumerate(devices):
+                if i == j or a.byPass.is_on or b.byPass.is_on or a.is_throttled or b.is_throttled or a.state == DeviceState.SOCFULL or b.state == DeviceState.SOCFULL:
+                    continue
+                if a.pwr_solar > 10 and b.pwr_solar > 10:
+                    ratio = a.pwr_solar / b.pwr_solar
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO pv_ratios VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (day, now.hour, now.minute, now.second, a.name, b.name, ratio)
                     )
+                    #_LOGGER.debug(
+                    #    f"[CALIBRATION] {a.name}/{b.name}: "
+                    #    f"{a.pwr_solar:.1f}W / {b.pwr_solar:.1f}W = Ratio {ratio:.3f}"
+                    #)
 
-    return protect_alloc
+        # Alte Daten (>7 Tage) entfernen
+        self.conn.execute("DELETE FROM pv_ratios WHERE day < date('now', '-7 day')")
+        self.conn.commit()
 
-
-def solar_helper(dev, solar_threshold_on=50, solar_threshold_off=30):
-    """
-    Prüft pro Gerät ob es trotz SOCEMPTY durch Solarleistung aktiviert werden darf.
-    Nutzt eine Hysterese: ON > 50W, OFF < 30W.
-    """
-    # initialisiere, falls das Attribut fehlt
-    if not hasattr(dev, "helper_active"):
-        dev.helper_active = False
-
-    if dev.pwr_solar > solar_threshold_on:
-        if not dev.helper_active:
-            _LOGGER.info(f"Helfer AKTIV für {dev.name}: PV={dev.pwr_solar}W > {solar_threshold_on}W")
-        dev.helper_active = True
-    elif dev.pwr_solar < solar_threshold_off:
-        if dev.helper_active:
-            _LOGGER.info(f"Helfer AUS für {dev.name}: PV={dev.pwr_solar}W < {solar_threshold_off}W")
-        dev.helper_active = False
-
-    return dev.helper_active
-
-
-_helper_mode_active = False  
-
-def should_use_helpers(needed: int) -> bool:
-    """
-    Hysterese für Helfer-Geräte:
-    - Aktivieren, wenn Restlast > 100W
-    - Deaktivieren, wenn Restlast < 30W
-    """
-    global _helper_mode_active
-
-    if needed > 50 and not _helper_mode_active:
-        _helper_mode_active = True
-        _LOGGER.debug(f"Helfer aktiviert: Restlast {needed}W > 50W")
-    elif needed < 10 and _helper_mode_active:
-        _helper_mode_active = False
-        _LOGGER.debug(f"Helfer deaktiviert: Restlast {needed}W < 30W")
-
-    return _helper_mode_active
-
-
-def update_extra_candidate(dev, on_threshold=50, off_threshold=30):
-    """
-    Aktiviert ein Gerät als extra_candidate nur, wenn genug PV-Leistung da ist.
-    Nutzt Hysterese: ON > on_threshold, OFF < off_threshold.
-    """
-    if not hasattr(dev, "extra_candidate_active"):
-        dev.extra_candidate_active = False
-
-    if dev.pwr_solar > on_threshold:
-        if not dev.extra_candidate_active:
-            _LOGGER.info(f"{dev.name} als Extra-Kandidat AKTIV (PV={dev.pwr_solar}W > {on_threshold}W)")
-        dev.extra_candidate_active = True
-    elif dev.pwr_solar < off_threshold:
-        if dev.extra_candidate_active:
-            _LOGGER.info(f"{dev.name} als Extra-Kandidat DEAKTIV (PV={dev.pwr_solar}W < {off_threshold}W)")
-        dev.extra_candidate_active = False
-
-    return dev.extra_candidate_active
-
-
-_last_active_count = 0
-_last_order: List[Any] = []
-
-def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainState, p1: int, rotate_flag: bool = False) -> Dict[Any, int]:
-
-    global _last_order, _last_active_count, _soc_protection_active
-
-    device_snapshots = []
-    allocation: Dict[Any, int] = {}
-
-    for dev in devices:
-        device_snapshots.append({
-            "name": dev.name,
-            "pwr_home_in": dev.pwr_home_in,
-            "pwr_home_out": dev.pwr_home_out,
-            "pwr_batt_in": dev.pwr_battery_in,
-            "pwr_batt_out": dev.pwr_battery_out,
-            "pwr_solar": dev.pwr_solar,
-            "soc_lvl": dev.soc_lvl,
-            "max_soc": dev.max_soc,
-            "min_soc": dev.min_soc,
-            "state": dev.state,
-            "limitCharge": dev.limitCharge,
-            "limitDischarge": dev.limitDischarge,
-            "pvStatus": dev.pvStatus,
-            "actualKwh": dev.actualKwh,
-            "kWh": dev.kWh,
-            "energy_diff_kwh": dev.energy_diff_kwh,
-        })
-
-    # Charge
-    if main_state == MainState.GRID_CHARGE:
-        candidates = [d for d in devices if d.state != DeviceState.SOCFULL and not d.is_throttled]
-    else:  # DISCHARGE
-        candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass and not d.is_throttled and not d.is_hand_bypass]
-        candidates_empty = [d for d in devices if d.state == DeviceState.SOCEMPTY and not solar_helper(d)]
-        for d in candidates_empty:
-            allocation[d] = 0
-
-        #soc protection at the morning an Hous priority
-        soc_alloc = handle_soc_protect(candidates, power_to_devide)
-        if _soc_protection_active:
-            allocation.update(soc_alloc)
-            candidates = [d for d in candidates if not d.is_soc_protect]
-
-    if not candidates:
-        if allocation:  # enthält die soc_alloc-Werte von handle_soc_protect devices
-            return allocation
-        return {d: 0 for d in devices}
-
-    # --- alte Reihenfolge wiederherstellen ---
-    if _last_order:
-        # nur Geräte nehmen, die jetzt auch Kandidaten sind
-        ordered = [d for d in _last_order if d in candidates]
-        # neue oder wieder aktivierte hinten anhängen
-        for d in candidates:
-            if d not in ordered:
-                ordered.append(d)
-        candidates = ordered
-
-    active_count = min(max(1, _last_active_count), len(candidates))
-
-    #Last % bestimmen
-    active_devs = candidates[:active_count]
-    first = active_devs[0]
-
-    limit = first.limitDischarge if main_state == MainState.GRID_DISCHARGE else abs(first.limitCharge)
-    total_limit = sum(d.limitDischarge if main_state == MainState.GRID_DISCHARGE else abs(d.limitCharge) for d in active_devs)
-    planned = abs(power_to_devide) * limit / total_limit
-    load_pct = (planned / limit) * 100 if limit > 0 else 0
-
-    _LOGGER.debug(
-        f"Load-Check: power_to_devide={power_to_devide}, "
-        f"active_count={active_count}, "
-        f"limit_first_dev={limit}, total_limit={total_limit}, "
-        f"planned={planned:.1f}, load_pct={load_pct:.1f}%"
-    )
-
-    # 20/60-Regel
-    if load_pct > 65 and active_count < len(candidates):
-        active_count += 1
-        _LOGGER.info("plus count")
-    elif load_pct < 23.5 and active_count > 1:
-        #hier das letzte gerät aus candidates[:active_count] auf 0 power setzten
-        last_dev = candidates[active_count - 1]
-        allocation[last_dev] = 0
-        active_count -= 1
-        _LOGGER.info(f"{last_dev.name} wurde deaktiviert wegen zu geringer Leistung")
-
-    _LOGGER.info(f"last count {_last_active_count} activecount {active_count}")
-    _last_active_count = active_count
-
-    # prüfen und rotieren
-    ROTATION_THRESHOLD = 0.05  # 5 % Energie differenz dann rotieren
-    if candidates:
-        first = candidates[0]
-        should_rotate = any(
-            abs(d.energy_diff_kwh) >= ROTATION_THRESHOLD * d.kWh
-            for d in candidates
+    def get_recent_avg_ratio(self, dev_a: str, dev_b: str, limit: int = 50):
+        """Nimmt die letzten `limit` Ratio-Werte zwischen zwei Geräten (zeitunabhängig)"""
+        cur = self.conn.execute(
+            """
+            SELECT ratio FROM pv_ratios
+            WHERE device_a=? AND device_b=?
+            ORDER BY day DESC, hour DESC, minute DESC, second DESC
+            LIMIT ?
+            """,
+            (dev_a, dev_b, limit)
         )
+        rows = [r[0] for r in cur.fetchall()]
+        if not rows:
+            #_LOGGER.debug(f"[RATIO] Keine Werte für {dev_a}/{dev_b} gefunden.")
+            return None
+        avg_ratio = sum(rows) / len(rows)
+        #_LOGGER.debug(f"[RATIO] Durchschnitt aus {len(rows)} Werten für {dev_a}/{dev_b}: {avg_ratio:.3f}")
+        return avg_ratio
 
-    if should_rotate or rotate_flag:
-        if rotate_flag:
-            _LOGGER.info("Manual rotation ausgeführt.")
-        for d in devices:
-            d.energy_diff_kwh = 0
-
-        if len(candidates) > active_count:
-            allocation[first] = 0
-            _LOGGER.info(
-                f"{first.name} wurde auf 0 gesetzt, da Rotation stattfand "
-                f"und es ein weiteres Gerät gibt zu nutzen!"
+    def expected_power(self, dev_a, dev_b_or_devices, min_ref_solar: int = 10):
+        """
+        Berechne erwartete PV-Leistung von dev_a.
+        - Wenn dev_b_or_devices eine Liste ist → nutze alle gültigen Referenzen (wie calc_extra_power)
+        - Wenn dev_b_or_devices ein einzelnes Gerät ist → klassischer Einzelvergleich
+        """
+        # --- Fall 1: Einzelgerät (alter Aufrufstil) ---
+        if not isinstance(dev_b_or_devices, list):
+            dev_b = dev_b_or_devices
+            ratio = self.get_recent_avg_ratio(dev_a.name, dev_b.name)
+            if not ratio:
+                return None
+            expected = dev_b.pwr_solar * ratio
+            _LOGGER.debug(
+                f"[EXPECTED] {dev_a.name}: erwartet {expected:.1f}W "
+                f"(ref {dev_b.name}, ratio={ratio:.3f})"
             )
+            return expected
 
-        soc_levels = [d.soc_lvl for d in candidates]
-        max_soc_lvl = max(soc_levels)
-        min_soc_lvl = min(soc_levels)
+        # --- Fall 2: Liste von Geräten (neuer Stil) ---
+        devices = dev_b_or_devices
+        refs = [
+            r for r in devices
+            if r.name != dev_a.name
+            and getattr(r, "state", None) != DeviceState.SOCFULL
+            and getattr(r, "pwr_solar", 0) > min_ref_solar
+            and getattr(r, "soc_lvl", 999) < getattr(dev_a, "soc_lvl", -1)
+            and not getattr(r, "byPass", None).is_on
+        ]
 
-        if max_soc_lvl - min_soc_lvl > 5:
-            if main_state == MainState.GRID_DISCHARGE:
-                # Discharge → das vollste Gerät zuerst nutzen
-                target = max(candidates[1:], key=lambda d: d.soc_lvl, default=None)
-                mode_text = "vollstes"
-            else:
-                # Charge → das leerste Gerät zuerst laden
-                target = min(candidates[1:], key=lambda d: d.soc_lvl, default=None)
-                mode_text = "leerstes"
+        if not refs:
+            return None
 
-            if target:
-                candidates.remove(target)
-                candidates.insert(0, target)
-                _LOGGER.info(
-                    f"SOC-Trick ({main_state}): {mode_text} Gerät {target.name} "
-                    f"(SOC={target.soc_lvl}%) wurde vor {first.name} (SOC={first.soc_lvl}%) gesetzt."
-                )
-        else:
-            # alle liegen nah beieinander
-            candidates.append(candidates.pop(0))
-            _LOGGER.debug("Normale Rotation, da SOC-Differenz ≤ 5%")
+        expected_vals = []
+        for r in refs:
+            ratio = self.get_recent_avg_ratio(dev_a.name, r.name)
+            if ratio is None:
+                continue
+            expected_vals.append(r.pwr_solar * ratio)
 
-    # Aktive Geräte festlegen
-    active_devs = candidates[:active_count]
-    _LOGGER.debug("Aktive Geräte: " + ", ".join(d.name for d in active_devs))
+        if not expected_vals:
+            return None
 
-    if main_state == MainState.GRID_DISCHARGE:
-
-        needed = 0
-        self_power_consumption = 0
-        helper_pwr = 0
-        pv_sum_active = sum(d.pwr_solar for d in active_devs)
-        pv_sum_active_is_bypass = sum(d.pwr_solar for d in devices if d.is_bypass)
-        pwr_sum_active_is_throttled = sum(d.pwr_home_out for d in devices if d.is_throttled)
-
-
-        # --- Theoretische PV-Summe aller aktiven Geräte ---
-        theoretic_pv_sum_active = 0
-        if pv_sum_active == 0:
-            for a in active_devs:
-                # passende Referenzen finden
-                refs = [
-                    r for r in devices
-                    if r.name != a.name
-                    and getattr(r, "pwr_solar", 0) > 10
-                ]
-
-                if not refs:
-                    _LOGGER.debug(f"[THEORETIC PV] Kein Referenzgerät für {a.name} gefunden.")
-                    continue
-
-                # Referenzgerät mit höchster PV-Leistung wählen
-                best_ref = max(refs, key=lambda r: r.pwr_solar)
-
-                expected = ratio_matrix.expected_power(a, best_ref)
-                if expected:
-                    theoretic_pv_sum_active += expected
-                    _LOGGER.debug(
-                        f"[THEORETIC PV] {a.name}: ref={best_ref.name}, "
-                        f"PV_ref={best_ref.pwr_solar:.1f}W, expected={expected:.1f}W"
-                    )
-                else:
-                    _LOGGER.debug(
-                        f"[THEORETIC PV] Keine Ratio-Daten für {a.name}/{best_ref.name} gefunden."
-                    )
-
-
-
-        if pv_sum_active >= abs(power_to_devide):
-            # Aktive Geräte haben genug PV  proportional, begrenzt auf deren PV
-            _LOGGER.debug(f"Aktive Geräte decken {pv_sum_active}W PV, genug für {power_to_devide}W")
-            total_pv = sum(d.pwr_solar for d in active_devs if d.pwr_solar > 30)
-            for d in active_devs:
-                share = (d.pwr_solar / total_pv) if total_pv > 0 else 0
-                allocation[d] = int(abs(power_to_devide) * share)
-        else:
-            # Nicht genug PV, prüfen ob andere Geräte PV haben
-            needed = abs(power_to_devide) - pv_sum_active - pv_sum_active_is_bypass - pwr_sum_active_is_throttled - theoretic_pv_sum_active
-            _LOGGER.debug(f"PV reicht nicht ({pv_sum_active + pv_sum_active_is_bypass}W), es fehlen {needed}W → suche Extra-PV-Geräte")
-
-            # Eigenverbrauch von Bypass-Geräten berücksichtigen und zu needed addieren
-            self_power_consumption = sum(
-                max(0, d.pwr_solar - d.pwr_home_out)
-                for d in active_devs
-                if d.byPass.is_on and d.state != DeviceState.SOCFULL
-            )
-
-            if self_power_consumption > 0:
-                _LOGGER.debug(f"Eigenverbrauch durch Bypass-Geräte: {self_power_consumption}W")
-                needed += self_power_consumption
-                _LOGGER.debug(
-                    f"Eigenverbrauch durch Bypass-Geräte erkannt: {self_power_consumption}W "
-                    f"→ auf needed addiert (neuer needed={needed}W)"
-                )
-
-            # nur nicht-aktive devices scannen + Hysterese berücksichtigen
-            extra_candidates = [
-                snap for snap in device_snapshots
-                if snap["name"] not in [d.name for d in active_devs]
-            ]
-
-            # Filter mit Hysterese
-            extra_candidates = [
-                snap for snap in extra_candidates
-                if update_extra_candidate(next(d for d in devices if d.name == snap["name"]))
-            ]
-
-            # sortiere nach größter PV-Leistung
-            extra_candidates.sort(key=lambda x: x["pwr_solar"], reverse=True)
-
-            for snap in extra_candidates:
-                dev = next((d for d in candidates if d.name == snap["name"]), None)
-                if dev is None:
-                    _LOGGER.warning(f"Kein Kandidat gefunden für Snapshot {snap['name']}, überspringe.")
-                    continue
-                if not should_use_helpers(needed):  # Abbruch, wenn fast gedeckt
-                    break
-                take = min(snap["pwr_solar"], needed + 0, dev.limitDischarge)
-                allocation[dev] = take
-                helper_pwr += take
-                needed -= take
-
-                dev.is_solar_helper = True 
-
-                _LOGGER.info(f"Zusatzgerät {dev.name}: {take}W direkt aus PV genutzt (PV={snap['pwr_solar']}W, Restbedarf={needed}W)")
-
-            #Leistung vertielen
-            power_to_devide = power_to_devide - helper_pwr
-            total_limit = sum(d.limitDischarge for d in active_devs)
-            for d in active_devs:
-                allocation[d] = int(abs(power_to_devide) * abs(d.limitDischarge) / total_limit)
-
+        avg_expected = sum(expected_vals) / len(expected_vals)
+        _LOGGER.debug(
+            f"[EXPECTED] {dev_a.name}: erwartet {avg_expected:.1f}W "
+            f"(aus {len(expected_vals)} Referenzen)"
+        )
+        return avg_expected
         
-        for d in devices:
-            #deaktiviere nicht-gebrauchte devices die erster in solar helper waren
-            if d.is_solar_helper and d not in allocation:
-                allocation[d] = 0
-                d.is_solar_helper = False
-                _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.")
-            #deaktiviere nicht-gebrauchte devices die erster in soc protect funktion waren
-            if d.is_soc_protect and d not in allocation:
-                if d.pwr_home_out != 0 or d.pwr_home_in != 0:
-                    allocation[d] = 0
-                    _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig. protection: {d.is_soc_protect}")
-                if d.soc_lvl > d.min_soc + 5:
-                    d.is_soc_protect = False
-                    _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig. protection: {d.is_soc_protect}")
+    def is_throttled(self, dev: Any, devices: List[Any], tolerance: float = 0.15, min_ref_solar: int = 10) -> bool:
+        """Prüft, ob Gerät 'dev' gedrosselt ist (über alle gültigen Referenzen)."""
+        refs = [
+            r for r in devices
+            if r.name != dev.name
+            and getattr(r, "state", None) != DeviceState.SOCFULL
+            and getattr(r, "pwr_solar", 0) > min_ref_solar
+            and getattr(r, "soc_lvl", 999) < getattr(dev, "soc_lvl", -1)
+            and not r.byPass.is_on
+        ]
+        if not refs:
+            dev._throttle_counter = 0
+            return False
 
-    else:  # GRID_CHARGE
-        needed = 0
-        total_limit = sum(d.limitCharge for d in active_devs)
-        for d in active_devs:
-            allocation[d] = int(abs(power_to_devide) * abs(d.limitCharge) / abs(total_limit))
+        diffs = []
+        for r in refs:
+            ratio = self.get_recent_avg_ratio(dev.name, r.name)
+            if ratio is None:
+                continue
+            expected = r.pwr_solar * ratio
+            if expected <= 0:
+                continue
+            diff = (expected - dev.pwr_solar) / expected
+            diffs.append(diff)
 
-    _last_order = candidates.copy()
+        if not diffs:
+            dev._throttle_counter = 0
+            return False
 
-    # --- Active-Flag setzen ---
-    for d in devices:
-        if d.active and d.pwr_home_out == 0 and d.pwr_home_in == 0:
-            d.active = False
-        if d in active_devs:
-            d.active = True
+        avg_diff = sum(diffs) / len(diffs)
 
-    bypass_alloc = handle_bypass(devices, needed, power_to_devide, p1)
-    allocation.update(bypass_alloc)
+        # --- Hysterese / Zähler ---
+        if not hasattr(dev, "_throttle_counter"):
+            dev._throttle_counter = 0
 
-    _LOGGER.debug("Finale Allocation: " + str({d.name: p for d, p in allocation.items()}))
+        if avg_diff > tolerance:
+            dev._throttle_counter += 1
+            _LOGGER.debug(f"[THROTTLE] {dev.name} erkannt ({avg_diff*100:.1f}%), Counter={dev._throttle_counter}")
+        else:
+            if getattr(dev, "_throttle_counter", 0) > 0:
+                dev._throttle_counter = 0
+            _LOGGER.debug(f"[THROTTLE] {dev.name} OK ({avg_diff*100:.1f}%), Counter={dev._throttle_counter}")
 
-    return allocation
+        # Erst nach 3x bestätigen
+        if dev._throttle_counter >= 5:
+            _LOGGER.info(f"[THROTTLE] {dev.name} gedrosselt erkannt.")
+            return True
+        else:
+            return False
+
+    def calc_extra_power(self, dev: Any, devices: List[Any], min_ref_solar: int = 10) -> int:
+        """Berechnet durchschnittliche fehlende Leistung gegenüber allen gültigen Referenzen."""
+        refs = [
+            r for r in devices
+            if r.name != dev.name
+            and getattr(r, "state", None) != DeviceState.SOCFULL
+            and getattr(r, "pwr_solar", 0) > min_ref_solar
+            and getattr(r, "soc_lvl", 999) < getattr(dev, "soc_lvl", -1)
+            and not r.byPass.is_on
+        ]
+        if not refs:
+            return 0
+
+        expected_vals = []
+        for r in refs:
+            ratio = self.get_recent_avg_ratio(dev.name, r.name)
+            if ratio is None:
+                continue
+            expected_vals.append(r.pwr_solar * ratio)
+
+        if not expected_vals:
+            return 0
+
+        avg_expected = sum(expected_vals) / len(expected_vals)
+        extra = avg_expected - dev.pwr_solar
+        _LOGGER.debug(f"[EXTRA] {dev.name}: +{extra:.1f}W (expected={avg_expected:.1f}, actual={dev.pwr_solar:.1f})")
+        return int(round(extra))

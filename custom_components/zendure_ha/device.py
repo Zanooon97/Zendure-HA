@@ -125,6 +125,7 @@ class ZendureDevice(EntityDevice):
         self.is_hand_bypass: bool = False #'Bypass On Off'
 
         self.is_soc_protect: bool = False 
+        self.is_solar_helper: bool = False 
         self.soc_helper_active: bool = False 
         self.helper_active: bool = False 
         self.extra_candidate_active: bool = False 

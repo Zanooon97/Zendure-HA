@@ -192,6 +192,9 @@ def handle_soc_protect(
         _soc_protection_active = True
         _LOGGER.debug(f"SOC-Schutz EIN: Solar={total_pv}W <= Last+5 ({load+5}W)")
 
+    soc_protect_devices = [dev for dev in devices if dev.is_soc_protect]
+    num_soc_protect = len(soc_protect_devices)
+
     # Nur wenn Schutz aktiv ist, Geräte markieren
     if _soc_protection_active:
         for d in devices:
@@ -202,9 +205,11 @@ def handle_soc_protect(
                 d.is_soc_protect = False
 
             # Hysterese für minimale Entladeleistung
-            if getattr(d, "is_soc_protect", False):
-                allowed = max(0, min(d.pwr_solar, d.limitDischarge, load))
-                load -= allowed
+            if d.is_soc_protect:
+
+                per_device_load = load / num_soc_protect if num_soc_protect > 0 else 0
+                allowed = max(0, min(d.pwr_solar if not d.byPass.is_on else d.limitDischarge, d.limitDischarge, per_device_load))
+
                 if not hasattr(d, "soc_helper_active"):
                     d.soc_helper_active = False
 
@@ -332,7 +337,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         soc_alloc = handle_soc_protect(candidates, power_to_devide)
         if _soc_protection_active:
             allocation.update(soc_alloc)
-            candidates = [d for d in candidates if not getattr(d, "is_soc_protect", False)]
+            candidates = [d for d in candidates if not d.is_soc_protect]
 
     if not candidates:
         if allocation:  # enthält die soc_alloc-Werte von handle_soc_protect devices
@@ -542,12 +547,12 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         
         for d in devices:
             #deaktiviere nicht-gebrauchte devices die erster in solar helper waren
-            if getattr(d, "is_solar_helper", False) and d not in allocation:
+            if d.is_solar_helper and d not in allocation:
                 allocation[d] = 0
                 d.is_solar_helper = False
                 _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.")
             #deaktiviere nicht-gebrauchte devices die erster in soc protect funktion waren
-            if getattr(d, "is_soc_protect", False) and d not in allocation:
+            if d.is_soc_protect and d not in allocation:
                 if d.pwr_home_out != 0 or d.pwr_home_in != 0:
                     allocation[d] = 0
                     _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig. protection: {d.is_soc_protect}")

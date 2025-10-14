@@ -57,7 +57,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         self.zero_next = datetime.min
         self.zero_fast = datetime.min
         self.check_reset = datetime.min
-        self.power_history: deque[int] = deque(maxlen=5)
+        self.power_history: deque[int] = deque(maxlen=3)
         self.power_volatility_history: deque[int] = deque(maxlen=40)
         self.power_home_history: deque[int] = deque(maxlen=10)
         self.p1_history: deque[int] = deque([25, -25], maxlen=8)
@@ -389,8 +389,23 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
 
                 if d.is_bypass or d.is_hand_bypass or d.is_throttled:
                     pwr_home_out = 0
-                elif d.is_soc_protect or d.soc_helper_active or d.helper_active or d.extra_candidate_active or d.active:
+                    _LOGGER.info(
+                        f"{d.name} →"
+                        f"{d.is_bypass} → is_bypass aktiv: "
+                        f"{d.is_hand_bypass} → is_hand_bypass aktiv: "
+                        f"{d.is_throttled} → is_throttled aktiv "
+                    )
+                elif d.is_soc_protect or d.soc_helper_active or d.helper_active or d.extra_candidate_active or d.active or d.state == DeviceState.SOCFULL:
                     pwr_home_out = d.pwr_home_out
+                    _LOGGER.info(
+                        f"{d.name} →"
+                        f"{d.active} → active aktiv: "
+                        f"{d.extra_candidate_active} → extra_candidate_active aktiv: "
+                        f"{d.helper_active} → helper_active aktiv: "
+                        f"{d.soc_helper_active} → soc_helper_active aktiv: "
+                        f"{d.is_soc_protect} → is_soc_protect aktiv: "
+                        f"{d.state} → state"
+                    )
                 else:
                     pwr_home_out = 0
 

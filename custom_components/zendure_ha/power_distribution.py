@@ -340,6 +340,9 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
             candidates = [d for d in candidates if not d.is_soc_protect]
 
     if not candidates:
+        if main_state == MainState.GRID_CHARGE:
+            bypass_alloc = handle_bypass(devices, 0, power_to_devide, p1)
+            allocation.update(bypass_alloc)
         if allocation:  # enthält die soc_alloc-Werte von handle_soc_protect devices
             return allocation
         return {d: 0 for d in devices}

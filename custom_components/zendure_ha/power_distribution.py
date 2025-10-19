@@ -88,11 +88,6 @@ def handle_bypass(devices: List[Any], needed: int, power_to_devide: int, p1: int
 
     ratio_matrix.calibrate(devices)
 
-    # Beispiel: Erwartete PV-Leistung berechnen
-    a = next(d for d in devices if d.name == "SolarFlow 800")
-    expected = ratio_matrix.expected_power(a, devices)
-    _LOGGER.info(f"Erwartete PV-Leistung für {a.name}: {expected} W")
-
     # Check: Gibt es noch Geräte unterhalb SOCFULL?
     has_non_full = any(d.state != DeviceState.SOCFULL for d in devices)
 
@@ -328,7 +323,7 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
     if main_state == MainState.GRID_CHARGE:
         candidates = [d for d in devices if d.state != DeviceState.SOCFULL and not d.is_throttled]
     else:  # DISCHARGE
-        candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass and not d.is_throttled and not d.is_hand_bypass]
+        candidates = [d for d in devices if (d.state != DeviceState.SOCEMPTY or solar_helper(d)) and not d.is_bypass and not d.is_throttled]
         candidates_empty = [d for d in devices if d.state == DeviceState.SOCEMPTY and not solar_helper(d)]
         for d in candidates_empty:
             allocation[d] = 0
@@ -418,11 +413,11 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         if max_soc_lvl - min_soc_lvl > 5:
             if main_state == MainState.GRID_DISCHARGE:
                 # Discharge → das vollste Gerät zuerst nutzen
-                target = max(candidates[1:], key=lambda d: d.soc_lvl, default=None)
+                target = max(candidates, key=lambda d: d.soc_lvl, default=None)
                 mode_text = "vollstes"
             else:
                 # Charge → das leerste Gerät zuerst laden
-                target = min(candidates[1:], key=lambda d: d.soc_lvl, default=None)
+                target = min(candidates, key=lambda d: d.soc_lvl, default=None)
                 mode_text = "leerstes"
 
             if target:
@@ -550,10 +545,25 @@ def distribute_power(devices: List[Any], power_to_devide: int, main_state: MainS
         
         for d in devices:
             #deaktiviere nicht-gebrauchte devices die erster in solar helper waren
+            if d.extra_candidate_active and d not in allocation:
+                allocation[d] = 0
+                d.extra_candidate_active = False
+                _LOGGER.debug(f"Helfer extra_candidate_active {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.")
+            #deaktiviere nicht-gebrauchte devices die erster in solar helper waren
+            if d.helper_active and d not in allocation:
+                allocation[d] = 0
+                d.helper_active = False
+                _LOGGER.debug(f"Helfer helper_active {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.")
+            #deaktiviere nicht-gebrauchte devices die erster in solar helper waren
+            if d.soc_helper_active and d not in allocation:
+                allocation[d] = 0
+                d.soc_helper_active = False
+                _LOGGER.debug(f"Helfer soc_helper_active {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.")
+            #deaktiviere nicht-gebrauchte devices die erster in solar helper waren
             if d.is_solar_helper and d not in allocation:
                 allocation[d] = 0
                 d.is_solar_helper = False
-                _LOGGER.debug(f"Helfer {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.")
+                _LOGGER.debug(f"Helfer is_solar_helper {d.name} wieder deaktiviert, keine PV-Unterstützung nötig.")
             #deaktiviere nicht-gebrauchte devices die erster in soc protect funktion waren
             if d.is_soc_protect and d not in allocation:
                 if d.pwr_home_out != 0 or d.pwr_home_in != 0:

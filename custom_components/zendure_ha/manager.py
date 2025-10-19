@@ -386,24 +386,25 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
         devices: list[ZendureDevice] = []
         for d in self.devices:
             if await d.power_get():
+                _LOGGER.info(f"Energiedifferenz {d.energy_diff_kwh} bei {d.name}")
 
                 if d.is_bypass or d.is_hand_bypass or d.is_throttled:
                     pwr_home_out = 0
                     _LOGGER.info(
                         f"{d.name} →"
-                        f"{d.is_bypass} → is_bypass aktiv: "
-                        f"{d.is_hand_bypass} → is_hand_bypass aktiv: "
-                        f"{d.is_throttled} → is_throttled aktiv "
+                        f"{d.is_bypass} → is_bypass / "
+                        f"{d.is_hand_bypass} → is_hand_bypass / "
+                        f"{d.is_throttled} → is_throttled / "
                     )
                 elif d.is_soc_protect or d.soc_helper_active or d.helper_active or d.extra_candidate_active or d.active or d.state == DeviceState.SOCFULL:
                     pwr_home_out = d.pwr_home_out
                     _LOGGER.info(
                         f"{d.name} →"
-                        f"{d.active} → active aktiv: "
-                        f"{d.extra_candidate_active} → extra_candidate_active aktiv: "
-                        f"{d.helper_active} → helper_active aktiv: "
-                        f"{d.soc_helper_active} → soc_helper_active aktiv: "
-                        f"{d.is_soc_protect} → is_soc_protect aktiv: "
+                        f"{d.active} → active / "
+                        f"{d.extra_candidate_active} → extra_candidate_active / "
+                        f"{d.helper_active} → helper_active / "
+                        f"{d.soc_helper_active} → soc_helper_active / "
+                        f"{d.is_soc_protect} → is_soc_protect / "
                         f"{d.state} → state"
                     )
                 else:
@@ -450,7 +451,7 @@ class ZendureManager(DataUpdateCoordinator[None], EntityDevice):
                 if (power_average > 0 and pwr_setpoint >= 0) or (power_average < 0 and pwr_setpoint <= 0):
                     await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, p1, isFast)
                 else:
-                    await self.powerDistribution(devices, power_average, 0, pwr_solar, p1, isFast)
+                    await self.powerDistribution(devices, power_average, pwr_setpoint, pwr_solar, p1, isFast)
 
             case SmartMode.MATCHING_DISCHARGE:
                 await self.powerDistribution(devices, power_average, max(0, pwr_setpoint), pwr_solar, p1, isFast)
